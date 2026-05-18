@@ -1,0 +1,156 @@
+{
+  "business_name": "Tony Buisness",
+  "default_service_area": "",
+  "dispatcher_phone": "",
+  "services": [
+    "Furnace Repair",
+    "AC Installation",
+    "Heat Pump Repair",
+    "Thermostat Service",
+    "Duct Cleaning"
+  ],
+  "office_hours": "Mon-Fri 8am-5pm",
+  "office_timezone": "America/Toronto",
+  "office_schedule": {
+    "mon": {
+      "start": "08:00",
+      "end": "17:00"
+    },
+    "tue": {
+      "start": "08:00",
+      "end": "17:00"
+    },
+    "wed": {
+      "start": "08:00",
+      "end": "17:00"
+    },
+    "thu": {
+      "start": "08:00",
+      "end": "17:00"
+    },
+    "fri": {
+      "start": "08:00",
+      "end": "17:00"
+    },
+    "sat": null,
+    "sun": null
+  },
+  "phone_number": "365-688-6743",
+  "lead_keywords": [
+    "quote",
+    "estimate",
+    "repair",
+    "install",
+    "not working",
+    "broken",
+    "no heat",
+    "no ac",
+    "service",
+    "emergency"
+  ],
+  "existing_keywords": [
+    "invoice",
+    "follow up",
+    "scheduled",
+    "warranty",
+    "technician",
+    "appointment"
+  ],
+  "spam_keywords": [
+    "seo",
+    "marketing",
+    "backlinks",
+    "unsubscribe",
+    "crypto",
+    "mailer-daemon",
+    "mail delivery subsystem",
+    "delivery status notification",
+    "undelivered",
+    "returned mail"
+  ],
+  "service_keyword_map": {
+    "Furnace Repair": [
+      "furnace",
+      "no heat",
+      "heat not working"
+    ],
+    "AC Installation": [
+      "ac install",
+      "ac installation",
+      "quote for ac"
+    ],
+    "AC Repair": [
+      "ac not cooling",
+      "air conditioner not cooling",
+      "ac broken"
+    ],
+    "Heat Pump Repair": [
+      "heat pump",
+      "heat pump not working"
+    ],
+    "Thermostat Service": [
+      "thermostat",
+      "house is freezing",
+      "shows 72"
+    ],
+    "Duct Cleaning": [
+      "duct cleaning",
+      "clean ducts"
+    ]
+  },
+  "imap_server": "imap.gmail.com",
+  "imap_port": 993,
+  "smtp_server": "smtp.gmail.com",
+  "smtp_port": 587,
+  "email_address": "tonymemes969@gmail.com",
+  "email_password": "sowbvlpqcbjfrldf",
+  "mailbox": "INBOX",
+  "sent_mailbox": "[Gmail]/Sent Mail",
+  "read_unseen_only": true,
+  "processed_ids_file": "data/processed_ids.txt",
+  "leads_csv_file": "data/hvac_leads.csv",
+  "service_requests_file": "data/service_requests.csv",
+  "draft_replies_file": "data/draft_replies.csv",
+  "job_tickets_file": "data/job_tickets.csv",
+  "db_path": "data/hvac_agent.db",
+  "sender_cooldown_file": "data/sender_cooldown.json",
+  "auto_reply_cooldown_hours": 24,
+  "auto_reply_enabled": false,
+  "follow_up_enabled": false,
+  "follow_up_delay_hours": 24,
+  "follow_up_state_file": "data/follow_up_state.json",
+  "dispatch_summary_enabled": true,
+  "dispatch_summary_interval_minutes": 60,
+  "dispatch_summary_recipient": "tonymemes969@gmail.com",
+  "dispatch_summary_state_file": "data/dispatch_summary_state.json",
+  "dispatch_summary_log_file": "logs/dispatch_summary.log",
+  "high_priority_keywords": [
+    "emergency",
+    "urgent",
+    "asap",
+    "no heat",
+    "no ac",
+    "not working",
+    "dead",
+    "freezing"
+  ],
+  "ticket_duplicate_mode": "update",
+  "license_key": "HVAC-TRIAL-002",
+  "license_keys_file": "valid_licenses.json",
+  "license_binding_file": "data/license_binding.json",
+  "license_enforcement": true,
+  "sms_enabled": false,
+  "sms_gateway_email": "",
+  "feature_auto_reply": false,
+  "feature_ticketing": true,
+  "feature_dispatch_summary": true,
+  "feature_sms_notifications": false,
+  "feature_follow_up": false,
+  "ignore_promotions": true,
+  "poll_interval_seconds": 30,
+  "heartbeat_interval_minutes": 30,
+  "ui_refresh_seconds": 5,
+  "error_log_file": "logs/error.log",
+  "agent_log_file": "logs/hvac_agent.log",
+  "dry_run": false
+}

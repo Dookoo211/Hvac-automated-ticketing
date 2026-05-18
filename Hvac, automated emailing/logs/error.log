@@ -1,0 +1,220 @@
+[2026-03-21T17:50:56.584383-04:00] main failure
+PermissionError: Invalid license_key. Contact support for activation.
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3368, in main
+    validate_license(config)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 454, in validate_license
+    raise PermissionError("Invalid license_key. Contact support for activation.")
+PermissionError: Invalid license_key. Contact support for activation.
+
+[2026-03-21T18:30:59.996579-04:00] main failure
+PermissionError: Invalid license_key. Contact support for activation.
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3578, in main
+    validate_license(config)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 481, in validate_license
+    raise PermissionError("Invalid license_key. Contact support for activation.")
+PermissionError: Invalid license_key. Contact support for activation.
+
+[2026-03-21T18:51:56.557402-04:00] main failure
+PermissionError: Invalid license_key. Contact support for activation.
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3578, in main
+    validate_license(config)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 481, in validate_license
+    raise PermissionError("Invalid license_key. Contact support for activation.")
+PermissionError: Invalid license_key. Contact support for activation.
+
+[2026-03-21T18:57:43.430162-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T18:58:13.962387-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T18:58:44.533886-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T18:59:15.172803-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T18:59:45.795415-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:00:16.523754-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:00:47.322517-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:01:17.954614-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:01:48.711320-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:02:19.461797-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:02:50.029525-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:03:20.693608-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2484, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1766, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
+[2026-03-21T19:16:13.481880-04:00] main failure
+UnboundLocalError: cannot access local variable 'bg_color' where it is not associated with a value
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3710, in main
+    run_ui(config, dry_run_override=dry_run_override)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2318, in run_ui
+    root.configure(bg=bg_color, highlightthickness=0, bd=0)
+                      ^^^^^^^^
+UnboundLocalError: cannot access local variable 'bg_color' where it is not associated with a value
+
+[2026-03-21T19:16:19.902582-04:00] main failure
+UnboundLocalError: cannot access local variable 'bg_color' where it is not associated with a value
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3710, in main
+    run_ui(config, dry_run_override=dry_run_override)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2318, in run_ui
+    root.configure(bg=bg_color, highlightthickness=0, bd=0)
+                      ^^^^^^^^
+UnboundLocalError: cannot access local variable 'bg_color' where it is not associated with a value
+
+[2026-03-21T19:17:00.487881-04:00] main failure
+TclError: unknown option "-borderwidth"
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3710, in main
+    run_ui(config, dry_run_override=dry_run_override)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2358, in run_ui
+    notebook.configure(borderwidth=0)
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1721, in configure
+    return self._configure('configure', cnf, kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1711, in _configure
+    self.tk.call(_flatten((self._w, cmd)) + self._options(cnf))
+_tkinter.TclError: unknown option "-borderwidth"
+
+[2026-03-21T19:17:30.668240-04:00] main failure
+TclError: expected integer but got "UI"
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 3709, in main
+    run_ui(config, dry_run_override=dry_run_override)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2724, in run_ui
+    ttk.Label(frame, text="HVAC Service Automation", style="Title.TLabel").pack(anchor="w")
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\tkinter\ttk.py", line 729, in __init__
+    Widget.__init__(self, master, "ttk::label", kw)
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\tkinter\ttk.py", line 527, in __init__
+    tkinter.Widget.__init__(self, master, widgetname, kw=kw)
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 2647, in __init__
+    self.tk.call(
+_tkinter.TclError: expected integer but got "UI"
+
+[2026-03-29T19:40:45.253320-04:00] ui worker cycle failure
+error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+Traceback (most recent call last):
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 2594, in worker_loop
+    process_inbox(config, dry_run_override=dry_run)
+  File "C:\Users\Lucap\Documents\CodeVs\Hvac, automated emailing\hvac_email_agent.py", line 1821, in process_inbox
+    imap_conn.login(config["email_address"], config["email_password"])
+  File "C:\Users\Lucap\AppData\Local\Programs\Python\Python311\Lib\imaplib.py", line 612, in login
+    raise self.error(dat[-1])
+imaplib.IMAP4.error: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+
