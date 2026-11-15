@@ -1,0 +1,37 @@
+# --- Secrets and per-install files: NEVER commit these ---
+# config.json holds mailbox settings (and, on old installs, a plaintext password).
+# Use config.example.json as the template instead.
+config.json
+config.json.bak*
+valid_licenses.json
+data/
+logs/
+backups/
+
+# Legacy root-level state files from older versions
+processed_ids.txt
+hvac_leads.csv
+service_requests.csv
+draft_replies.csv
+job_tickets.csv
+sender_cooldown.json
+follow_up_state.json
+dispatch_summary_state.json
+dispatch_summary.log
+error.log
+*.db
+*.db-wal
+*.db-shm
+*.lock
+
+# --- Python / tooling ---
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# --- Build output ---
+build/
+dist/
+release/
+*.spec
