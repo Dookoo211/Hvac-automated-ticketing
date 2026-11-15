@@ -247,6 +247,22 @@ DEFAULT_HVAC_CONTEXT_KEYWORDS = [
     "system turns on",
     "system running",
     "everything seems to be running",
+    # Added in Phase 1 (AUDIT H4): common HVAC equipment the old list missed,
+    # e.g. "boiler won't fire" and "AC blowing warm air" scored zero.
+    "boiler",
+    "radiator",
+    "radiators",
+    "mini split",
+    "mini-split",
+    "ductless",
+    "air conditioning",
+    "central air",
+    "a/c",
+    "ac unit",
+    "compressor",
+    "condenser",
+    "water heater",
+    "carbon monoxide",
 ]
 
 DEFAULT_HVAC_PROBLEM_KEYWORDS = [
@@ -267,6 +283,26 @@ DEFAULT_HVAC_PROBLEM_KEYWORDS = [
     "home is cold",
     "heat isnt working",
     "heat isn't working",
+    # Added in Phase 1 (AUDIT H4)
+    "not cooling",
+    "blowing warm",
+    "warm air",
+    "leak",
+    "leaking",
+    "noise",
+    "noisy",
+    "banging",
+    "rattling",
+    "won't turn on",
+    "wont turn on",
+    "not turning on",
+    "won't fire",
+    "wont fire",
+    "no hot air",
+    "no cold air",
+    "short cycling",
+    "frozen",
+    "cold",
 ]
 
 STRONG_HVAC_PROBLEM_KEYWORDS = [
@@ -287,6 +323,12 @@ STRONG_HVAC_PROBLEM_KEYWORDS = [
     "heat isn't working",
     "smells weird",
     "weird smell",
+    "not cooling",
+    "blowing warm",
+    "leaking",
+    "won't turn on",
+    "not turning on",
+    "won't fire",
 ]
 
 DEFAULT_NON_HVAC_KEYWORDS = [
@@ -300,75 +342,56 @@ DEFAULT_NON_HVAC_KEYWORDS = [
     "roof leak",
 ]
 
+# Phrases that only bulk/marketing mail uses. WHY trimmed in Phase 1
+# (AUDIT H4): the old list contained everyday words real customers write
+# ("confirm", "update", "availability", "deal", "special", "account",
+# "feedback", "calendar") and a single hit turned a genuine quote request into
+# spam. Keep this list to multi-word phrases a homeowner wouldn't type.
 DEFAULT_MARKETING_KEYWORDS = [
     "unsubscribe",
     "manage preferences",
+    "manage your preferences",
+    "email preferences",
     "view in browser",
+    "view this email in your browser",
     "newsletter",
-    "welcome",
-    "account",
     "security alert",
-    "verify",
-    "confirm",
-    "tips",
-    "recommendations",
-    "promo",
-    "promotion",
-    "credits",
-    "subscription",
-    "update",
-    "roadmap",
-    "trial",
+    "verify your email",
+    "confirm your email",
     "thanks for signing up",
     "get started",
     "privacy policy",
     "terms of service",
-    "product manager",
-    "user research",
-    "customer interview",
-    "feedback",
-    "quick chat",
-    "schedule a call",
-    "schedule a chat",
-    "book a time",
-    "grab a time",
-    "time that works",
-    "learn more about your experience",
     "special offer",
-    "special",
-    "discount",
-    "coupon",
-    "limited time",
-    "sale",
+    "limited time offer",
     "promo code",
-    "deal",
+    "coupon code",
+    "free trial",
+    "you're receiving this email",
+    "you are receiving this email",
 ]
 
+# Sales/research outreach ("can we grab 20 minutes?"). Also phrases only.
 DEFAULT_OUTREACH_KEYWORDS = [
     "product manager",
     "user research",
     "customer interview",
-    "feedback",
     "quick chat",
-    "20 minute",
-    "30 minute",
-    "20-30 minute",
-    "20–30 minute",
     "schedule a call",
     "schedule a chat",
     "book a time",
     "grab a time",
-    "time that works",
-    "calendar",
-    "availability",
-    "talk with you",
+    "time that works for you",
     "we'd love to learn",
     "we would love to learn",
     "learn more about your experience",
+    "calendly.com",
 ]
 
+# (?<!\d)/(?!\d): don't pick 10 digits out of the middle of a longer
+# order/account number (AUDIT M9).
 PHONE_PATTERN = re.compile(
-    r"(?:\+?1[\s\-\.]?)?(?:\(?\d{3}\)?[\s\-\.]?)\d{3}[\s\-\.]?\d{4}",
+    r"(?<!\d)(?:\+?1[\s\-\.]?)?(?:\(?\d{3}\)?[\s\-\.]?)\d{3}[\s\-\.]?\d{4}(?!\d)",
     flags=re.IGNORECASE,
 )
 
@@ -843,15 +866,21 @@ def normalize_text(text: str) -> str:
 
 
 def keyword_hits(text: str, keyword: str) -> int:
-    """Count keyword occurrences with a word-boundary first pass and safe fallback."""
+    """Count whole-word/phrase occurrences of keyword in (normalized) text.
+
+    WHY no substring fallback any more (AUDIT H3): the old version fell back
+    to ``str.count`` when the word-boundary search found nothing, so "ac"
+    matched "contact", "heat" matched "theater", "dead" matched "deadline" and
+    "vent" matched "event". A note about a theater-event deadline was
+    classified as a furnace lead.
+    """
     key = keyword.lower().strip()
     if not key:
         return 0
-    pattern = r"\b" + re.escape(key) + r"\b"
-    matches = re.findall(pattern, text)
-    if matches:
-        return len(matches)
-    return text.count(key)
+    # (?<!\w) / (?!\w) instead of \b so keywords that start/end with
+    # punctuation (e.g. "a/c") still match as whole tokens.
+    pattern = r"(?<!\w)" + re.escape(key) + r"(?!\w)"
+    return len(re.findall(pattern, text))
 
 
 def hvac_intent_boost(text: str) -> tuple[int, int]:
@@ -887,42 +916,45 @@ def is_hvac_related(subject: str, body: str, service_detected: str = "") -> bool
         return True
     if hvac_problem_hits > 0:
         intent_terms = ("house", "home", "heat", "heating", "warm", "cold", "furnace", "ac", "thermostat")
-        if any(term in text for term in intent_terms):
+        if any(keyword_hits(text, term) for term in intent_terms):
             return True
     return False
 
 
-def is_marketing_email(sender_email: str, subject: str, body: str) -> bool:
-    """Detect marketing/newsletter/notification emails."""
+def is_marketing_email(sender_email: str, subject: str, body: str, msg: Message | None = None) -> bool:
+    """Detect marketing/newsletter/notification/outreach emails.
+
+    Signals: no-reply style sender, mailing-list headers, any outreach phrase,
+    or at least two marketing phrases. WHY two (AUDIT H4): one stray phrase
+    (a customer forwarding a promo, a footer) shouldn't turn a lead into spam.
+    """
     text = normalize_text(f"{subject}\n{body}")
     sender = (sender_email or "").lower()
-    if "no-reply" in sender or "noreply" in sender or "mailer-daemon" in sender:
+    if any(tag in sender for tag in ("no-reply", "noreply", "donotreply", "do-not-reply", "mailer-daemon")):
         return True
-    outreach_hits = sum(keyword_hits(text, keyword) for keyword in DEFAULT_OUTREACH_KEYWORDS)
-    if outreach_hits > 0:
+    if msg is not None:
+        try:
+            if msg.get("List-Unsubscribe") or msg.get("List-Id"):
+                return True
+        except Exception:
+            pass
+    if sum(keyword_hits(text, keyword) for keyword in DEFAULT_OUTREACH_KEYWORDS) > 0:
         return True
-    if any(keyword in text for keyword in ("calendly", "meet.google.com", "zoom.us", "schedule a time")):
-        return True
-    hits = sum(keyword_hits(text, keyword) for keyword in DEFAULT_MARKETING_KEYWORDS)
-    return hits > 0
+    return sum(keyword_hits(text, keyword) for keyword in DEFAULT_MARKETING_KEYWORDS) >= 2
 
 
 def has_customer_intent(subject: str, body: str, structured_fields: bool) -> bool:
-    """Return True when the message reads like a real customer HVAC request."""
+    """Return True when the message reads like a real customer HVAC request.
+
+    WHY phone/address alone no longer count (AUDIT M9): nearly every marketing
+    footer contains a phone number and street address, which used to exempt
+    newsletters from the spam rule. (The old version also had two branches
+    that both returned True.)
+    """
     if structured_fields:
         return True
-    if extract_phone(body):
-        return True
-    if extract_address(body) != "Unknown":
-        return True
     text = normalize_text(f"{subject}\n{body}")
-    if any(keyword in text for keyword in STRONG_HVAC_PROBLEM_KEYWORDS):
-        first_person_tokens = ("my ", "our ", "i ", "i'm", "im ", "we ", "we've", "we have")
-        if any(token in text for token in first_person_tokens):
-            return True
-        # Strong problem statements can still be genuine even without "my".
-        return True
-    return False
+    return any(keyword_hits(text, keyword) for keyword in STRONG_HVAC_PROBLEM_KEYWORDS)
 
 
 def classify(subject: str, body: str, config: dict) -> ClassificationResult:
@@ -949,6 +981,21 @@ def classify(subject: str, body: str, config: dict) -> ClassificationResult:
             "home is cold",
             "heat isnt working",
             "heat isn't working",
+            # Added in Phase 1 (AUDIT H4)
+            "boiler",
+            "radiator",
+            "not cooling",
+            "blowing warm",
+            "warm air",
+            "leaking",
+            "won't turn on",
+            "not turning on",
+            "no hot air",
+            "no cold air",
+            "heat pump",
+            "air conditioner",
+            "mini split",
+            "ac unit",
         }
     )
     lead_score = sum(keyword_hits(haystack, kw) * 2 for kw in lead_keywords)
@@ -973,12 +1020,16 @@ def classify(subject: str, body: str, config: dict) -> ClassificationResult:
         "spam": spam_score,
     }
 
+    # WHY "unclear" (AUDIT H4): ties and all-zero scores used to become
+    # "existing", which means no ticket at all, so real leads with unusual
+    # wording vanished. The caller turns "unclear" into "review" (ticket for
+    # staff, NO auto-reply) when the mail is HVAC-related, else "existing".
     max_score = max(scores.values())
     if max_score == 0:
-        classification = "existing"
+        classification = "unclear"
     else:
         winners = [label for label, score in scores.items() if score == max_score]
-        classification = winners[0] if len(winners) == 1 else "existing"
+        classification = winners[0] if len(winners) == 1 else "unclear"
 
     return ClassificationResult(
         classification=classification,
@@ -989,13 +1040,13 @@ def classify(subject: str, body: str, config: dict) -> ClassificationResult:
 
 
 def resolve_service_name(service: str, configured_services: list[str]) -> str:
-    """Map detected service to configured catalog, with AC fallback handling."""
-    if service in configured_services:
-        return service
+    """Return the detected service unchanged.
 
-    if service == "AC Repair" and "AC Installation" in configured_services:
-        return "AC Installation"
-
+    WHY (AUDIT M7): this used to rename "AC Repair" to "AC Installation" when
+    the catalog had no AC Repair entry, which told a customer with a broken AC
+    that we'd logged an installation request. A service outside the catalog is
+    still the more accurate label for staff.
+    """
     return service
 
 
@@ -1004,8 +1055,9 @@ def detect_service(subject: str, body: str, config: dict) -> str:
     text = normalize_text(f"{subject}\n{body}")
     services = config.get("services", [])
 
+    # Whole-word matching throughout (AUDIT H3): "heater" must not match "theater".
     for service in services:
-        if service.lower() in text:
+        if keyword_hits(text, service):
             return service
 
     service_map = config.get("service_keyword_map", {})
@@ -1023,26 +1075,22 @@ def detect_service(subject: str, body: str, config: dict) -> str:
     if best_score > 0:
         return resolve_service_name(best_service, services)
 
-    if "no heat" in text or "furnace" in text or "heater" in text or "heat not work" in text:
+    def has_any(*phrases: str) -> bool:
+        return any(keyword_hits(text, phrase) for phrase in phrases)
+
+    if has_any("no heat", "furnace", "heater", "heat not work"):
         return "Furnace Repair"
 
-    if "ac not cooling" in text or "air conditioner not cooling" in text:
-        if "AC Repair" in services:
-            return "AC Repair"
-        if "AC Installation" in services:
-            return "AC Installation"
+    if has_any("ac not cooling", "air conditioner not cooling"):
         return "AC Repair"
 
-    if "thermostat" in text or "house is freezing" in text or "shows 72" in text:
+    if has_any("thermostat", "house is freezing", "shows 72"):
         return "Thermostat Service"
 
-    if "smells weird" in text or "weird smell" in text or "burning smell" in text:
-        return "AC Repair"
-
-    if "heat pump not working" in text or "heat pump" in text:
+    if has_any("heat pump"):
         return "Heat Pump Repair"
 
-    if "duct" in text:
+    if has_any("duct", "ducts", "duct cleaning"):
         return "Duct Cleaning"
 
     return "Unknown"
@@ -1051,9 +1099,9 @@ def detect_service(subject: str, body: str, config: dict) -> str:
 def infer_request_type(subject: str, body: str) -> str:
     """Infer whether a message is a quote inquiry or service request."""
     text = normalize_text(f"{subject}\n{body}")
-    if "quote" in text or "estimate" in text:
+    if keyword_hits(text, "quote") or keyword_hits(text, "estimate"):
         return "quote"
-    if "maintenance" in text or "tune up" in text or "tune-up" in text:
+    if any(keyword_hits(text, phrase) for phrase in ("maintenance", "tune up", "tune-up")):
         return "maintenance"
     return "service"
 
@@ -1068,32 +1116,50 @@ def fallback_name_from_email(sender_email: str) -> str:
     return " ".join(token.capitalize() for token in tokens) if tokens else "there"
 
 
+NAME_TOKEN = r"[A-Z][a-zA-Z'\-]+"
+PERSON_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z .'\-]{0,39}$")
+
+
+def looks_like_person_name(value: str) -> bool:
+    """1-4 words of letters only, max 40 chars: safe to put after "Hi"."""
+    value = " ".join(str(value or "").split())
+    return bool(value) and bool(PERSON_NAME_RE.match(value)) and len(value.split()) <= 4
+
+
 def extract_customer_name(body: str, sender_name: str, sender_email: str) -> str:
-    """Extract customer name from email body first, then sender name/email fallback."""
+    """Best guess at the customer's name for the ticket.
+
+    Order: explicit "Name: X" line, "my name is X" (capitalised words only),
+    the From: display name, a capitalised signature after "Thanks,", and
+    finally the email's local part.
+
+    WHY (AUDIT M8): the old patterns "i am ..." and "this is ..." produced
+    names like "Having Trouble With My" and "Urgent", which then appeared in
+    the customer's greeting.
+    """
     body_for_search = body.replace("\r", "\n")
 
     for raw_line in body_for_search.splitlines():
         line = raw_line.strip()
-        if not line:
-            continue
-        line_match = re.match(r"^name\s*(?:is|maybe)?\s*[:\-]?\s*([a-z][a-z .'-]{0,40})$", line, flags=re.IGNORECASE)
+        line_match = re.match(r"^name\s*(?:is)?\s*[:\-]\s*([a-z][a-z .'-]{0,40})$", line, flags=re.IGNORECASE)
         if line_match:
             candidate = " ".join(line_match.group(1).split())
             return " ".join(part.capitalize() for part in candidate.split())
 
-    patterns = [
-        r"(?:my name is|name is|name maybe|this is|i am)[ \t]+([a-z]+(?:[ \t]+[a-z]+){0,3})",
-        r"(?:regards|thanks|thank you|sincerely|best),?[ \t]*\n+[ \t]*([a-z]+(?:[ \t]+[a-z]+){0,3})",
-    ]
-    body_lower = body_for_search.lower()
-    for pattern in patterns:
-        match = re.search(pattern, body_lower, flags=re.MULTILINE)
-        if match:
-            candidate = " ".join(match.group(1).split())
-            return " ".join(part.capitalize() for part in candidate.split())
+    match = re.search(rf"(?i:\bmy name is)\s+({NAME_TOKEN}(?:[ \t]+{NAME_TOKEN}){{0,2}})", body_for_search)
+    if match:
+        return match.group(1)
 
-    if sender_name:
-        return sender_name
+    if looks_like_person_name(sender_name):
+        return " ".join(sender_name.split())
+
+    signature = re.search(
+        rf"(?i:\b(?:regards|thanks|thank you|sincerely|best|cheers)),?[ \t]*\n+[ \t]*({NAME_TOKEN}(?:[ \t]+{NAME_TOKEN}){{0,2}})[ \t]*$",
+        body_for_search,
+        flags=re.MULTILINE,
+    )
+    if signature:
+        return signature.group(1)
 
     if sender_email:
         return fallback_name_from_email(sender_email)
@@ -1101,11 +1167,31 @@ def extract_customer_name(body: str, sender_name: str, sender_email: str) -> str
     return "there"
 
 
+def greeting_name(request: dict | None, sender_display_name: str) -> str:
+    """Name used after "Hi" in customer emails: only something that clearly is a name.
+
+    The email local-part fallback is deliberately excluded ("Hi Tonymemes969"
+    reads as a bot); "there" is the safe default.
+    """
+    candidates = [sender_display_name]
+    if request:
+        candidates.insert(0, str(request.get("customer_name", "")))
+    local_fallback = ""
+    if request and request.get("sender_email"):
+        local_fallback = fallback_name_from_email(str(request["sender_email"]))
+    for candidate in candidates:
+        candidate = " ".join(str(candidate or "").split())
+        if candidate and candidate != local_fallback and looks_like_person_name(candidate):
+            return candidate
+    return "there"
+
+
 def extract_address(body: str) -> str:
     """Extract a likely street address from message body text."""
     label_match = re.search(r"^\s*address\s*[:\-]\s*(.+)$", body, flags=re.IGNORECASE | re.MULTILINE)
     if label_match:
-        candidate = label_match.group(1).strip()
+        # Capped: this value comes straight from the sender (AUDIT H9).
+        candidate = label_match.group(1).strip()[:120]
         if candidate:
             return candidate
 
@@ -1113,13 +1199,8 @@ def extract_address(body: str) -> str:
     if match:
         return match.group(0).strip()
 
-    for raw_line in body.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if re.match(r"^\d{1,6}\s+[A-Za-z0-9 .'-]{4,}$", line):
-            return line
-
+    # WHY the old "any line starting with a number" fallback is gone (AUDIT M9):
+    # it extracted "20 minutes ago it stopped working" as an address.
     return "Unknown"
 
 
@@ -1138,11 +1219,10 @@ def has_structured_fields(body: str) -> bool:
             continue
         if re.match(r"^(name|phone|address)\s*[:\-]\s*.+", line, flags=re.IGNORECASE):
             label_hits += 1
-    if label_hits >= 2:
-        return True
-    if extract_phone(body) and extract_address(body) != "Unknown":
-        return True
-    return False
+    # WHY labels only (AUDIT M9): "has a phone number and a street address"
+    # matched almost every marketing footer and forced newsletters to "lead".
+    # Web-form style "Name: / Phone: / Address:" lines are the real signal.
+    return label_hits >= 2
 
 
 def make_google_maps_link(address: str) -> str:
@@ -1200,7 +1280,8 @@ def infer_priority(subject: str, body: str, config: dict) -> str:
     """Infer lead priority using configurable urgent keyword list."""
     text = normalize_text(f"{subject}\n{body}")
     high_priority_keywords = [normalize_text(str(item)) for item in config.get("high_priority_keywords", [])]
-    if any(keyword and keyword in text for keyword in high_priority_keywords):
+    # Whole words only: "dead" must not make a "deadline" email High priority.
+    if any(keyword and keyword_hits(text, keyword) for keyword in high_priority_keywords):
         return "High"
     return "Normal"
 
