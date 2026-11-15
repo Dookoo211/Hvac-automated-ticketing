@@ -6,7 +6,8 @@ Make the local-first HVAC email auto-responder (Python, Windows) reliable and sa
 - Phase 0 and Phase 1 are DONE and pushed to https://github.com/Dookoo211/Hvac-automated-ticketing (branch `main`).
 - The inbox cycle is crash-safe. SQLite is the single source of truth and CSVs are exports. Dry-run is read-only. Reply-safety rules, caps, the single-instance lock and backoff are all in place.
 - 82 pytest tests pass against fake IMAP/SMTP (no network).
-- NOT yet run against the real mailbox. The user's local `config.json` still has the plaintext password (see Next steps 1–2).
+- NOT yet run against the real mailbox.
+- Local config.json migrated 2026-11-15: no password in the file, password in Windows Credential Manager (service HVACEmailAgent), flags collapsed; backup without password: config.json.bak-20261115-122820.
 
 ## Done (checklist, newest last)
 - [x] Located project folder; created HANDOFF.md
@@ -22,11 +23,11 @@ Make the local-first HVAC email auto-responder (Python, Windows) reliable and sa
 - [x] AUDIT.md "Phase 1 results" + this file
 
 ## In progress (exact file + what's left)
-- Nothing in progress. Waiting on the user for: password revocation, history-rewrite decision, running migrate_config locally.
+- Nothing in progress. Waiting on the user for: password revocation and the history-rewrite decision.
 
 ## Next steps (ordered)
 1. USER: revoke the exposed Gmail app password (Google Account → Security → App passwords) and create a new one.
-2. USER/agent with approval: run `.venv\Scripts\python scripts\migrate_config.py --check`, then without `--check`, so the local config.json stops holding the password (it writes to the real Windows Credential Manager, so ask first). Afterwards, set the NEW app password via `python hvac_email_agent.py --quick-setup`.
+2. DONE 2026-11-15: migrate_config.py run (with user approval). After revoking, the user saves the NEW app password with `.venv\Scripts\python hvac_email_agent.py --quick-setup` (it overwrites the Credential Manager entry). Note: quick setup currently resets auto_reply/dry_run (M16).
 3. Decide on a history rewrite of the public repo (needs a force-push) to purge old commits containing the password. Revoking is what actually protects the account.
 4. First live verification with the user present: `--dry-run` (now safe) against the real mailbox, then a one-shot live run with auto_reply off.
 5. Phase 2: split into modules (hvac/config, mail, classifier, extraction, store, tickets, followups, dispatch, safety, ui, cli). Also: headless daemon EXE + startup task (M15, decision 7), setup must not clobber settings (M16), M13, delete or fix migrate_csv_to_db.py (L1), dead UI functions (N3), L2–L4, L8, L10, L11, Gmail category filtering for `ignore_promotions` (M4).
@@ -80,7 +81,7 @@ Make the local-first HVAC email auto-responder (Python, Windows) reliable and sa
 - Project path contains a comma and spaces: always quote it.
 - The PUBLIC repo's history (commits before 9d12af8) still contains the Gmail app password and a third party's email address. Commit d945318 (this session, fixed in e8c38f9) also contains the mailbox's username as an example string. A history rewrite would cover all of these.
 - Before every push: `git grep -niE '<real addresses>' HEAD` must return nothing, and the push must be gated on that result (a missed check let d945318 through).
-- The user's local config.json still holds the plaintext password (works, prints a warning) until migrate_config runs.
+- Plaintext copies of the OLD password still exist locally in: backups/phase0-20261115-120325/config.json (gitignored) and the stray Documents/CodeVs/Hvac, automated emailing/config.json (not touched). They're harmless once the password is revoked; delete only with the user's OK.
 - `ignore_promotions` is accepted but has no effect (the old filter never worked).
 - Classifier is keyword-based; see AUDIT "Known classifier limits".
 - Writing files from bash heredocs with backslash-heavy Python failed once; put patch scripts in the scratchpad and run them.
@@ -93,4 +94,4 @@ Make the local-first HVAC email auto-responder (Python, Windows) reliable and sa
 - reset_install.bat: tested in a temp folder; backup made before delete.
 - Couldn't verify: real Gmail IMAP/SMTP behaviour, a real Authentication-Results header, PyInstaller build, interactive UI clicking, startup task.
 
-## Last updated: 2026-11-15 (end of Phase 1)
+## Last updated: 2026-11-15 (end of Phase 1, config migrated)
