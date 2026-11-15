@@ -6,29 +6,29 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
-import imaplib
 import json
 import os
 import re
-import smtplib
 import threading
 import time as time_module
 import traceback
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from email.policy import default
-from email.utils import getaddresses, parseaddr, parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app import crm, credentials, database, notifications, scheduler, settings, technicians
-from app.fileutil import atomic_write_json, atomic_write_text, backup_paths
+from app import crm, credentials, database, legacy_import, safety, scheduler, settings, store, technicians
+from app.instance_lock import AlreadyRunningError, InstanceLock
+from app.mailbox import ImapMailbox, MailAuthError, MailUnavailable, SendFailed, SmtpSender
+from app.safety import mark_automatic
+from app.fileutil import atomic_write_json, backup_paths
 from app.settings import ConfigError
 
 
@@ -481,37 +481,6 @@ def has_email_credentials(config: dict) -> bool:
     return bool(str(config.get("email_address", "")).strip()) and credentials.has_credentials(config)
 
 
-def load_processed_ids(path: Path) -> set[str]:
-    """Read processed message IDs used for de-duplication."""
-    if not path.exists():
-        return set()
-    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
-
-
-def save_processed_ids(path: Path, processed_ids: set[str]) -> None:
-    """Persist processed message IDs to disk."""
-    sorted_ids = sorted(processed_ids)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(sorted_ids) + ("\n" if sorted_ids else ""), encoding="utf-8")
-
-
-def load_json_dict(path: Path) -> dict:
-    """Load a JSON object file, returning an empty dict on missing/invalid content."""
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def save_json_dict(path: Path, data: dict) -> None:
-    """Write a JSON dictionary to disk with indentation."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
 def system_now() -> datetime:
     """Return current system-local datetime with timezone info."""
     return datetime.now().astimezone()
@@ -731,6 +700,20 @@ def patch_config_file(config_path: Path, updates: dict) -> None:
     atomic_write_json(config_path, raw)
 
 
+def store_mail_password(config: dict, new_password: str) -> None:
+    """Save the mailbox password to Windows Credential Manager (AUDIT C5).
+
+    Must run BEFORE config.json is written, because config.json never holds
+    the password any more. If no new password was typed but an old install
+    still has one in plaintext, that one is moved over, so pressing Enter in
+    setup can never lose the login. Raises credentials.CredentialError.
+    """
+    password = (new_password or "").replace(" ", "").strip() or credentials.plaintext_password(config)
+    if password:
+        credentials.set_password(config["email_address"], password)
+    config.pop("email_password", None)
+
+
 def ensure_runtime_paths(config: dict, base_dir: Path) -> None:
     """Create runtime folders/files directories relative to the config location."""
     path_fields = [
@@ -748,25 +731,14 @@ def ensure_runtime_paths(config: dict, base_dir: Path) -> None:
         "agent_log_file",
         "license_binding_file",
     ]
-    for field in path_fields:
-        raw = str(config.get(field, "")).strip()
+    for key in path_fields:
+        raw = str(config.get(key, "")).strip()
         if not raw:
             continue
         path = Path(raw)
         if not path.is_absolute():
             path = base_dir / path
         path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def ensure_csv_headers(path: Path, headers: list[str]) -> None:
-    """Ensure a CSV file exists with the expected header row."""
-    if path.exists() and path.stat().st_size > 0:
-        return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
 
 
 def append_dispatch_log(path: Path, content: str) -> None:
@@ -776,29 +748,8 @@ def append_dispatch_log(path: Path, content: str) -> None:
         f.write(f"[{utc_now_iso()}]\n{content}\n\n")
 
 
-def ensure_csv_header(path: Path) -> None:
-    """Create the lead CSV file with headers when it does not exist yet."""
-    if path.exists() and path.stat().st_size > 0:
-        return
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "timestamp",
-                "sender_email",
-                "detected_name",
-                "service_detected",
-                "subject",
-                "classification",
-            ]
-        )
 
 
-def append_csv_row(path: Path, row: list[str]) -> None:
-    """Append one lead/event record row to CSV."""
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(row)
 def clean_subject(raw_subject: str | None) -> str:
     """Decode MIME/encoded-word email subjects into plain text."""
     if not raw_subject:
@@ -1345,40 +1296,6 @@ def generate_draft_reply(config: dict, request: dict, in_office_hours: bool) -> 
     return subject, body
 
 
-def load_dispatch_summary_state(path: Path) -> dict:
-    """Load dispatch summary state with safe defaults."""
-    data = load_json_dict(path)
-    if not isinstance(data, dict):
-        return {"last_summary_at": "", "pending": []}
-    data.setdefault("last_summary_at", "")
-    if not isinstance(data.get("pending"), list):
-        data["pending"] = []
-    return data
-
-
-def append_dispatch_pending(dispatch_state: dict, request: dict) -> None:
-    """Append a structured request entry to pending dispatch summary queue."""
-    dispatch_state.setdefault("pending", [])
-    dispatch_state["pending"].append(
-        {
-            "timestamp": request.get("timestamp", utc_now_iso()),
-            "issue": request.get("issue", "HVAC request"),
-            "address": request.get("address", "Unknown"),
-            "priority": request.get("priority", "Normal"),
-            "request_type": request.get("request_type", "service"),
-            "service_detected": request.get("service_detected", "Unknown"),
-            "ticket_id": request.get("ticket_id", ""),
-            "maps_link": request.get("maps_link", ""),
-        }
-    )
-
-
-def generate_job_ticket_id(message_id: str) -> str:
-    """Generate a deterministic ticket ID from message context and local timestamp."""
-    safe_fragment = re.sub(r"[^A-Za-z0-9]", "", message_id)[-6:] or "000000"
-    return f"TKT-{system_now().strftime('%Y%m%d-%H%M%S')}-{safe_fragment.upper()}"
-
-
 def split_first_last_name(customer_name: str) -> tuple[str, str]:
     """Split free-form customer name into first and last components."""
     tokens = [token for token in str(customer_name).strip().split() if token]
@@ -1387,125 +1304,6 @@ def split_first_last_name(customer_name: str) -> tuple[str, str]:
     if len(tokens) == 1:
         return (tokens[0], "")
     return (tokens[0], " ".join(tokens[1:]))
-
-
-def normalize_ticket_signature(ticket_like: dict) -> tuple[str, str, str, str, str, str, str]:
-    """Build duplicate-detection signature for ticket-like records."""
-    return (
-        normalize_text(str(ticket_like.get("sender_email", ""))),
-        normalize_text(str(ticket_like.get("first_name", ""))),
-        normalize_text(str(ticket_like.get("last_name", ""))),
-        normalize_text(str(ticket_like.get("address", ""))),
-        normalize_text(str(ticket_like.get("issue", ""))),
-        normalize_text(str(ticket_like.get("service_detected", ""))),
-        normalize_text(str(ticket_like.get("request_type", ""))),
-    )
-
-
-def load_csv_rows(path: Path) -> list[dict]:
-    """Load CSV rows as dictionaries."""
-    if not path.exists() or path.stat().st_size == 0:
-        return []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def save_csv_rows(path: Path, headers: list[str], rows: list[dict]) -> None:
-    """Persist CSV dictionary rows with fixed header order."""
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({header: row.get(header, "") for header in headers})
-
-
-def create_job_ticket_from_request(request: dict, message_id: str) -> dict:
-    """Create a normalized job ticket payload from extracted request details."""
-    first_name, last_name = split_first_last_name(str(request.get("customer_name", "")))
-    return {
-        "ticket_id": generate_job_ticket_id(message_id),
-        "created_at": request.get("timestamp", utc_now_iso()),
-        "last_updated_at": request.get("timestamp", utc_now_iso()),
-        "occurrence_count": "1",
-        "status": "Open",
-        "customer_name": request.get("customer_name", "there"),
-        "first_name": first_name,
-        "last_name": last_name,
-        "sender_email": request.get("sender_email", ""),
-        "address": request.get("address", "Unknown"),
-        "maps_link": request.get("maps_link", ""),
-        "issue": request.get("issue", "HVAC inquiry"),
-        "priority": request.get("priority", "Normal"),
-        "service_detected": request.get("service_detected", "Unknown"),
-        "request_type": request.get("request_type", "service"),
-        "assigned_technician": "",
-    }
-
-
-def upsert_job_ticket(path: Path, ticket: dict, config: dict) -> tuple[str, str]:
-    """Create/update/replace/delete duplicate tickets based on configured strategy."""
-    headers = [
-        "ticket_id",
-        "created_at",
-        "last_updated_at",
-        "occurrence_count",
-        "status",
-        "customer_name",
-        "first_name",
-        "last_name",
-        "sender_email",
-        "address",
-        "maps_link",
-        "issue",
-        "priority",
-        "service_detected",
-        "request_type",
-        "assigned_technician",
-    ]
-    mode = normalize_text(str(config.get("ticket_duplicate_mode", "update"))) or "update"
-    rows = load_csv_rows(path)
-    incoming_sig = normalize_ticket_signature(ticket)
-    now_iso = utc_now_iso()
-
-    duplicate_index = -1
-    for idx, row in enumerate(rows):
-        if normalize_ticket_signature(row) == incoming_sig:
-            duplicate_index = idx
-            break
-
-    if duplicate_index == -1:
-        rows.append(ticket)
-        save_csv_rows(path, headers, rows)
-        return str(ticket.get("ticket_id", "")), "created"
-
-    existing = rows[duplicate_index]
-    existing_count = int(str(existing.get("occurrence_count", "1") or "1"))
-    new_count = str(existing_count + 1)
-
-    if mode == "replace":
-        replacement = dict(ticket)
-        replacement["occurrence_count"] = new_count
-        replacement["last_updated_at"] = now_iso
-        rows[duplicate_index] = replacement
-        save_csv_rows(path, headers, rows)
-        return str(replacement.get("ticket_id", "")), "replaced"
-
-    if mode == "delete":
-        # Keep original ticket and silently ignore creating duplicate record.
-        existing["occurrence_count"] = new_count
-        existing["last_updated_at"] = now_iso
-        rows[duplicate_index] = existing
-        save_csv_rows(path, headers, rows)
-        return str(existing.get("ticket_id", "")), "ignored-duplicate"
-
-    # Default: update existing ticket record.
-    existing["last_updated_at"] = now_iso
-    existing["occurrence_count"] = new_count
-    for key in ["address", "maps_link", "issue", "priority", "service_detected", "request_type"]:
-        existing[key] = ticket.get(key, existing.get(key, ""))
-    rows[duplicate_index] = existing
-    save_csv_rows(path, headers, rows)
-    return str(existing.get("ticket_id", "")), "updated"
 
 
 def build_dispatch_summary_body(pending_items: list[dict]) -> str:
@@ -1519,7 +1317,9 @@ def build_dispatch_summary_body(pending_items: list[dict]) -> str:
         ticket_id = item.get("ticket_id", "")
         maps_link = item.get("maps_link", "")
         ticket_segment = f"{ticket_id} | " if ticket_id else ""
-        lines.append(f"{idx}. {ticket_segment}[{priority}] {issue} - {address} ({request_type})")
+        # "review" = HVAC-related but unclear; staff should read it (no auto-reply was sent).
+        review_segment = "[REVIEW] " if item.get("review") else ""
+        lines.append(f"{idx}. {ticket_segment}{review_segment}[{priority}] {issue} - {address} ({request_type})")
         if maps_link:
             lines.append(f"   Map: {maps_link}")
     return "\n".join(lines)
@@ -1535,26 +1335,6 @@ def safe_recipient_name(display_name: str) -> str:
     """Return a polite fallback name when sender display name is missing."""
     return display_name if display_name else "there"
 
-
-def should_skip_auto_reply(sender_email: str, msg: Message, own_email: str) -> bool:
-    """Suppress auto-replies for self, no-reply, bulk, and auto-submitted messages."""
-    lower_sender = sender_email.lower()
-    if not lower_sender:
-        return True
-    if lower_sender == own_email.lower():
-        return True
-    if any(tag in lower_sender for tag in ["noreply", "no-reply", "donotreply", "do-not-reply"]):
-        return True
-
-    auto_submitted = (msg.get("Auto-Submitted") or "").lower()
-    if auto_submitted and auto_submitted != "no":
-        return True
-
-    precedence = (msg.get("Precedence") or "").lower()
-    if precedence in {"bulk", "junk", "list"}:
-        return True
-
-    return False
 
 def parse_hhmm(value: str) -> time | None:
     """Parse a HH:MM string into a time object."""
@@ -1599,24 +1379,65 @@ def is_within_office_hours(config: dict, now_utc: datetime | None = None) -> boo
     return current_time >= start or current_time <= end
 
 
+def _safe_header(msg: Message, name: str) -> str:
+    """Read a header without letting a malformed one crash the cycle (AUDIT H6)."""
+    try:
+        return str(msg.get(name, "") or "")
+    except Exception:
+        return ""
+
+
+def _one_line(value: str, limit: int = 998) -> str:
+    """Collapse whitespace/newlines so a value is safe to put in a header."""
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _reply_subject(original_subject: str) -> str:
+    subject = _one_line(original_subject, 80)
+    if not subject:
+        return "Re: Your service request"
+    return subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+
 def build_ack_message(
     config: dict,
     recipient_email: str,
     recipient_name: str,
     in_office_hours: bool,
-    request_details: dict | None = None,
+    ticket_id: str = "",
+    original: Message | None = None,
 ) -> EmailMessage:
-    """Build lead acknowledgment message with in-hours/after-hours branch."""
+    """Build the lead acknowledgment (in-hours / after-hours wording).
+
+    WHY fixed wording (AUDIT H9): the body used to repeat the sender's issue
+    text, address and a Maps link built from it. Combined with a forged From:
+    address, that let anyone make this mailbox send their text to a third
+    party. The only variable parts now are a letters-only greeting name, the
+    ticket number, and the subject of the email we answer (so the reply
+    threads in the customer's mail app). Staff see full details in the ticket
+    and the draft reply. With require_sender_auth on, the subject can only
+    come from the genuine owner of the address we reply to.
+    """
     business_name = config["business_name"]
     office_hours = config["office_hours"]
     phone_number = config["phone_number"]
 
     reply = EmailMessage()
-    reply["Subject"] = f"Re: Thanks for contacting {business_name}"
+    reply["Subject"] = (
+        _reply_subject(clean_subject(_safe_header(original, "Subject")))
+        if original is not None
+        else f"Thanks for contacting {business_name}"
+    )
     reply["From"] = config["email_address"]
     reply["To"] = recipient_email
-    reply["X-HVAC-Auto"] = "true"
-    reply["X-HVAC-Auto-Type"] = "ack_in_hours" if in_office_hours else "ack_after_hours"
+    if original is not None:
+        # Threading headers (AUDIT M11) so the reply lands in the same conversation.
+        original_id = _one_line(_safe_header(original, "Message-ID"))
+        if original_id:
+            reply["In-Reply-To"] = original_id
+            references = _one_line(_safe_header(original, "References"))
+            reply["References"] = f"{references} {original_id}".strip()
+    mark_automatic(reply, "ack")
 
     if in_office_hours:
         timing_line = f"We've received your message and a member of our team will review it during business hours ({office_hours})."
@@ -1625,32 +1446,11 @@ def build_ack_message(
             "We've received your message and our team will respond during the next business day "
             f"({office_hours})."
         )
-
-    request_block = ""
-    if request_details:
-        issue = str(request_details.get("issue", "")).strip()
-        address = str(request_details.get("address", "")).strip()
-        maps_link = str(request_details.get("maps_link", "")).strip()
-        service = str(request_details.get("service_detected", "")).strip()
-        ticket_id = str(request_details.get("ticket_id", "")).strip()
-        pieces = []
-        if ticket_id:
-            pieces.append(f"Ticket ID: {ticket_id}")
-        if service and service != "Unknown":
-            pieces.append(f"Service type: {service}")
-        if issue:
-            pieces.append(f"Issue noted: {issue}")
-        if address and address != "Unknown":
-            pieces.append(f"Location: {address}")
-        if maps_link:
-            pieces.append(f"Map link: {maps_link}")
-        if pieces:
-            request_block = "\n".join(pieces) + "\n\n"
-
+    reference_line = f"Your reference number is {ticket_id}.\n\n" if ticket_id else ""
     body = (
-        f"Hi {safe_recipient_name(recipient_name)},\n\n"
+        f"Hi {recipient_name or 'there'},\n\n"
         "Thank you for reaching out regarding your HVAC inquiry.\n\n"
-        f"{request_block}"
+        f"{reference_line}"
         f"{timing_line}\n\n"
         f"If this is urgent, please call us directly at {phone_number}.\n\n"
         "We look forward to assisting you.\n\n"
@@ -1670,8 +1470,7 @@ def build_follow_up_message(config: dict, recipient_email: str, recipient_name: 
     reply["Subject"] = "Re: Following up on your HVAC inquiry"
     reply["From"] = config["email_address"]
     reply["To"] = recipient_email
-    reply["X-HVAC-Auto"] = "true"
-    reply["X-HVAC-Auto-Type"] = "follow_up"
+    mark_automatic(reply, "follow_up")
 
     body = (
         f"Hi {safe_recipient_name(recipient_name)},\n\n"
@@ -1685,831 +1484,680 @@ def build_follow_up_message(config: dict, recipient_email: str, recipient_name: 
     return reply
 
 
-def send_reply(config: dict, message: EmailMessage) -> None:
-    """Send email via SMTP (implicit TLS on 465, STARTTLS otherwise)."""
-    smtp_server = config["smtp_server"]
-    smtp_port = int(config["smtp_port"])
-    username = config["email_address"]
-    password = config["email_password"]
-
-    if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30) as smtp:
-            smtp.login(username, password)
-            smtp.send_message(message)
-        return
-
-    with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.ehlo()
-        smtp.login(username, password)
-        smtp.send_message(message)
-
-
-def fetch_message_ids(imap_conn: imaplib.IMAP4_SSL, unseen_only: bool) -> list[bytes]:
-    """Fetch message sequence numbers for target mailbox selection criteria."""
-    criteria = "UNSEEN" if unseen_only else "ALL"
-    status, data = imap_conn.search(None, criteria)
-    if status != "OK" or not data or not data[0]:
-        return []
-    return data[0].split()
-
-
-def select_mailbox(imap_conn: imaplib.IMAP4_SSL, mailbox: str, readonly: bool = False) -> bool:
-    """Select an IMAP mailbox and return whether selection succeeded."""
-    status, _ = imap_conn.select(mailbox, readonly=readonly)
-    return status == "OK"
-
-
-def iter_messages(imap_conn: imaplib.IMAP4_SSL, message_nums: Iterable[bytes]):
-    """Yield decoded message objects for IMAP sequence numbers."""
-    for num in message_nums:
-        status, data = imap_conn.fetch(num, "(RFC822)")
-        if status != "OK" or not data:
-            continue
-
-        raw = None
-        for chunk in data:
-            if isinstance(chunk, tuple) and len(chunk) > 1:
-                raw = chunk[1]
-                break
-
-        if not raw:
-            continue
-
-        msg = message_from_bytes(raw, policy=default)
-        yield num.decode("utf-8", errors="ignore"), msg
-
-
-def filter_out_promotions(imap_conn: imaplib.IMAP4_SSL, message_nums: list[bytes]) -> list[bytes]:
-    """Remove Gmail promotions/social/category messages if configured."""
-    filtered: list[bytes] = []
-    for msg_num in message_nums:
-        try:
-            status, data = imap_conn.fetch(msg_num, "(BODY.PEEK[HEADER.FIELDS (X-GM-LABELS)])")
-        except imaplib.IMAP4.error:
-            filtered.append(msg_num)
-            continue
-        if status != "OK" or not data or not data[0]:
-            filtered.append(msg_num)
-            continue
-        header_blob = data[0][1].decode(errors="ignore").lower()
-        if "x-gm-labels" in header_blob and (
-            "\\promotions" in header_blob or "promotions" in header_blob or "\\social" in header_blob or "social" in header_blob
-        ):
-            continue
-        filtered.append(msg_num)
-    return filtered
-
-def parse_iso_datetime(value: str | None) -> datetime | None:
-    """Parse ISO timestamp and normalize to UTC."""
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def in_sender_cooldown(sender_email: str, sender_cooldown: dict, now_utc: datetime, cooldown_hours: int) -> bool:
-    """Return True when sender is still inside reply cooldown window."""
-    last_reply_iso = sender_cooldown.get(sender_email)
-    last_reply = parse_iso_datetime(last_reply_iso)
-    if not last_reply:
-        return False
-    return now_utc < (last_reply + timedelta(hours=cooldown_hours))
-
-
-def register_follow_up_record(
-    follow_up_state: dict,
-    message_id: str,
-    sender_email: str,
-    detected_name: str,
-    subject: str,
-    now_utc: datetime,
-    delay_hours: int,
-) -> None:
-    """Store follow-up tracking metadata for a newly detected lead message."""
-    if message_id in follow_up_state:
-        return
-
-    follow_up_state[message_id] = {
-        "sender_email": sender_email,
-        "detected_name": detected_name,
-        "subject": subject,
-        "lead_timestamp": now_utc.isoformat(),
-        "follow_up_due_at": (now_utc + timedelta(hours=delay_hours)).isoformat(),
-        "follow_up_sent": False,
-        "follow_up_sent_at": None,
-        "manual_reply_detected": False,
-        "manual_reply_at": None,
-    }
-
-
-def resolve_sent_mailbox(imap_conn: imaplib.IMAP4_SSL, config: dict) -> str | None:
-    """Find a usable sent-mailbox folder from configured and common provider names."""
-    candidates = [
-        config.get("sent_mailbox", ""),
-        "Sent",
-        "Sent Items",
-        "INBOX.Sent",
-        "[Gmail]/Sent Mail",
-    ]
-    seen: set[str] = set()
-
-    for mailbox in candidates:
-        candidate = str(mailbox).strip()
-        if not candidate or candidate.lower() in seen:
-            continue
-        seen.add(candidate.lower())
-        if select_mailbox(imap_conn, candidate, readonly=True):
-            return candidate
-
-    return None
-
-
 def message_datetime_utc(msg: Message) -> datetime | None:
     """Read and normalize message Date header to UTC."""
-    raw_date = msg.get("Date")
+    raw_date = _safe_header(msg, "Date")
     if not raw_date:
         return None
-
     try:
         sent_dt = parsedate_to_datetime(raw_date)
     except Exception:
         return None
-
     if sent_dt.tzinfo is None:
         sent_dt = sent_dt.replace(tzinfo=timezone.utc)
-
     return sent_dt.astimezone(timezone.utc)
 
 
-def fetch_manual_reply_times(
-    imap_conn: imaplib.IMAP4_SSL,
-    config: dict,
-    since_utc: datetime,
-) -> dict[str, datetime]:
-    """Map recipient emails to latest manual sent-reply timestamp from sent mailbox."""
-    manual_reply_times: dict[str, datetime] = {}
-    inbox_mailbox = config.get("mailbox", "INBOX")
-
-    sent_mailbox = resolve_sent_mailbox(imap_conn, config)
-    if not sent_mailbox:
-        select_mailbox(imap_conn, inbox_mailbox)
-        return manual_reply_times
-
-    since_key = since_utc.strftime("%d-%b-%Y")
-    status, data = imap_conn.search(None, "SINCE", since_key)
-    if status != "OK" or not data or not data[0]:
-        select_mailbox(imap_conn, inbox_mailbox)
-        return manual_reply_times
-
-    own_email = config["email_address"].lower()
-
-    for _, msg in iter_messages(imap_conn, data[0].split()):
-        from_email = parseaddr(msg.get("From", ""))[1].strip().lower()
-        if from_email != own_email:
-            continue
-
-        if (msg.get("X-HVAC-Auto") or "").strip().lower() == "true":
-            continue
-
-        sent_at = message_datetime_utc(msg)
-        if not sent_at or sent_at < since_utc:
-            continue
-
-        recipients = [
-            addr.strip().lower()
-            for _, addr in getaddresses([msg.get("To", ""), msg.get("Cc", "")])
-            if addr.strip()
-        ]
-
-        for recipient in recipients:
-            previous = manual_reply_times.get(recipient)
-            if not previous or sent_at > previous:
-                manual_reply_times[recipient] = sent_at
-
-    select_mailbox(imap_conn, inbox_mailbox)
-    return manual_reply_times
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    """Parse ISO timestamp and normalize to UTC."""
+    return store.parse_iso(value)
 
 
-def process_follow_up_queue(
-    imap_conn: imaplib.IMAP4_SSL,
-    config: dict,
-    follow_up_state: dict,
-    sender_cooldown: dict,
-    dry_run: bool,
-) -> int:
-    """Send due follow-up reminders when no manual reply is detected."""
-    if not config.get("follow_up_enabled", False):
-        return 0
+# ---------------------------------------------------------------------------
+# Inbox cycle
+# ---------------------------------------------------------------------------
 
-    pending: list[tuple[str, dict]] = []
-    earliest_lead_time: datetime | None = None
+SENT_MAILBOX_FALLBACKS = ["Sent", "Sent Items", "INBOX.Sent", "[Gmail]/Sent Mail"]
+MAX_MESSAGE_ATTEMPTS = 3          # a message that keeps failing is left unread for staff
+FOLLOW_UP_GRACE_HOURS = 48        # never send a follow-up this late (agent was offline)
+AUTO_EMAIL_KINDS = ("ack", "follow_up")
 
-    for lead_id, record in follow_up_state.items():
-        if not isinstance(record, dict):
-            continue
-        if record.get("follow_up_sent") or record.get("manual_reply_detected"):
-            continue
 
-        lead_time = parse_iso_datetime(record.get("lead_timestamp"))
-        if lead_time and (earliest_lead_time is None or lead_time < earliest_lead_time):
-            earliest_lead_time = lead_time
+def resolve_dry_run(config: dict, dry_run_override: bool | None) -> bool:
+    return bool(config.get("dry_run", False)) if dry_run_override is None else bool(dry_run_override)
 
-        pending.append((lead_id, record))
 
-    if not pending:
-        return 0
+def lock_path_for(config: dict) -> Path:
+    return Path(str(config.get("db_path", "data/hvac_agent.db"))).parent / "agent.lock"
 
-    now_utc = datetime.now(timezone.utc)
-    manual_reply_times = {}
-    if earliest_lead_time is not None:
-        manual_reply_times = fetch_manual_reply_times(imap_conn, config, earliest_lead_time)
 
-    cooldown_hours = int(config.get("auto_reply_cooldown_hours", 24))
-    follow_ups_sent = 0
+def csv_export_paths(config: dict) -> dict[str, Path]:
+    keys = ["leads_csv_file", "service_requests_file", "draft_replies_file", "job_tickets_file"]
+    return {key: Path(str(config[key])) for key in keys if str(config.get(key, "")).strip()}
 
-    for _, record in pending:
-        sender_email = str(record.get("sender_email", "")).strip().lower()
-        lead_time = parse_iso_datetime(record.get("lead_timestamp"))
 
-        if sender_email and lead_time:
-            manual_reply_at = manual_reply_times.get(sender_email)
-            if manual_reply_at and manual_reply_at >= lead_time:
-                record["manual_reply_detected"] = True
-                record["manual_reply_at"] = manual_reply_at.isoformat()
-                continue
+def default_mailbox_factory(config: dict, password: str) -> ImapMailbox:
+    return ImapMailbox(
+        config["imap_server"], int(config["imap_port"]), config["email_address"], password,
+        timeout=float(config.get("network_timeout_seconds", 30)),
+    )
 
-        due_at = parse_iso_datetime(record.get("follow_up_due_at"))
-        if not due_at or now_utc < due_at:
-            continue
 
-        if not sender_email:
-            record["manual_reply_detected"] = True
-            record["manual_reply_at"] = now_utc.isoformat()
-            continue
+def default_smtp_factory(config: dict, password: str) -> SmtpSender:
+    return SmtpSender(
+        config["smtp_server"], int(config["smtp_port"]), config["email_address"], password,
+        timeout=float(config.get("network_timeout_seconds", 30)),
+    )
 
-        if in_sender_cooldown(sender_email, sender_cooldown, now_utc, cooldown_hours):
-            continue
 
-        recipient_name = str(record.get("detected_name", "")).strip()
-        follow_up_message = build_follow_up_message(config, sender_email, recipient_name)
+@dataclass
+class CycleStats:
+    dry_run: bool = False
+    inspected: int = 0
+    processed: int = 0
+    skipped_known: int = 0
+    ignored_own: int = 0
+    failed: int = 0
+    auto_replies: int = 0
+    follow_ups: int = 0
+    dispatch_items: int = 0
+    by_class: dict = field(default_factory=dict)
 
-        if dry_run:
-            print(f"[DRY RUN] Would send follow-up to {sender_email}")
+
+class Outbox:
+    """Sends mail and records the outcome in SQLite.
+
+    The caller writes the 'pending' outbound row in the same transaction as
+    the decision to send, so a crash can never send without a record
+    (at-most-once delivery). In dry-run nothing leaves the machine.
+    """
+
+    def __init__(self, conn, smtp: SmtpSender | None, dry_run: bool):
+        self.conn = conn
+        self.smtp = smtp
+        self.dry_run = dry_run
+
+    def ensure_ready(self) -> None:
+        """Connect + log in BEFORE we commit an intent to send (raises MailUnavailable)."""
+        if not self.dry_run:
+            self.smtp.connect()
+
+    def deliver(self, outbound_id: int, message: EmailMessage, now: datetime) -> bool:
+        if self.dry_run:
+            print(f"[DRY RUN] Would send {message.get('X-HVAC-Auto-Type', 'email')} to {message['To']} | {message['Subject']}")
+            with store.transaction(self.conn):
+                store.set_outbound_status(self.conn, outbound_id, "dry_run", now)
+            return True
+        try:
+            self.smtp.send(message)
+        except (SendFailed, MailUnavailable) as err:
+            # Never retried automatically: if ambiguous it may have arrived,
+            # and a duplicate is worse than one missed acknowledgment.
+            with store.transaction(self.conn):
+                store.set_outbound_status(self.conn, outbound_id, "failed", now, str(err)[:500])
+            print(f"Send failed to {message['To']}: {err}")
+            return False
+        with store.transaction(self.conn):
+            store.set_outbound_status(self.conn, outbound_id, "sent", now)
+        return True
+
+
+@dataclass
+class CycleContext:
+    config: dict
+    conn: object
+    mbox: object
+    outbox: Outbox
+    dry_run: bool
+    mailbox_name: str
+    uidvalidity: str
+    own_addresses: set
+    stats: CycleStats
+    now: object  # callable returning an aware UTC datetime
+
+    def finish(self, uid: str) -> None:
+        """Mark a fully handled message as read (old behaviour), never in dry-run.
+
+        Done only AFTER the database commit (AUDIT C1). A failure here is
+        harmless: the database, not the \\Seen flag, is what prevents
+        re-processing.
+        """
+        if self.dry_run or not self.config.get("mark_processed_as_read", True):
+            return
+        try:
+            self.mbox.mark_seen(uid)
+        except Exception as err:
+            append_error_log(self.config, f"mark_seen uid={uid}", err)
+
+
+def analyze_message(msg: Message, config: dict) -> dict:
+    """Pure classification/extraction step (no I/O)."""
+    subject = clean_subject(_safe_header(msg, "Subject"))
+    body = extract_plain_text(msg)
+    sender_name, sender_email = parseaddr(_safe_header(msg, "From"))
+    sender_name, sender_email = sender_name.strip(), sender_email.strip().lower()
+
+    result = classify(subject, body, config)
+    service = detect_service(subject, body, config)
+    hvac_related = is_hvac_related(subject, body, service)
+    structured_fields = has_structured_fields(body)
+    marketing = is_marketing_email(sender_email, subject, body, msg)
+    customer_intent = has_customer_intent(subject, body, structured_fields)
+
+    classification = result.classification
+    if marketing and not customer_intent:
+        classification = "spam"
+    elif not hvac_related:
+        classification = "spam" if classification == "spam" else "existing"
+    elif classification not in ("lead", "spam") and structured_fields and not marketing:
+        classification = "lead"
+    elif classification == "unclear":
+        # HVAC-related but no clear signal: ticket for a human, no auto-reply.
+        classification = "review"
+    if classification == "unclear":
+        classification = "existing"
+
+    return {
+        "subject": subject,
+        "body": body,
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "result": result,
+        "classification": classification,
+        "service": service,
+        "hvac_related": hvac_related,
+        "structured_fields": structured_fields,
+        "marketing": marketing,
+        "customer_intent": customer_intent,
+    }
+
+
+def decide_auto_reply(ctx: CycleContext, analysis: dict, block_reason: str | None, received_at: datetime | None, now: datetime) -> tuple[bool, str]:
+    """Return (send?, reason-if-not). Every rule here can only PREVENT a reply."""
+    config = ctx.config
+    if not config.get("auto_reply_enabled", False):
+        return False, "auto-reply disabled"
+    if analysis["classification"] != "lead":
+        return False, f"classified as {analysis['classification']}"
+    if block_reason:
+        return False, block_reason
+    max_age = float(config.get("max_reply_age_hours", 48))
+    reference_time = received_at or analysis.get("date_header")
+    if max_age > 0 and reference_time and now - reference_time > timedelta(hours=max_age):
+        return False, f"message older than {max_age:g}h"
+    if store.in_cooldown(ctx.conn, analysis["sender_email"], now, float(config.get("auto_reply_cooldown_hours", 24))):
+        return False, "sender cooldown active"
+    cap = int(config.get("max_auto_emails_per_day", 50))
+    if store.count_outbound_since(ctx.conn, AUTO_EMAIL_KINDS, now - timedelta(hours=24)) >= cap:
+        return False, f"daily auto-email cap ({cap}) reached"
+    return True, ""
+
+
+def record_message(ctx: CycleContext, key: str, analysis: dict, now: datetime) -> dict:
+    """Write all database effects of one inbound email (caller holds the transaction)."""
+    conn, config = ctx.conn, ctx.config
+    classification = analysis["classification"]
+    sender = analysis["sender_email"]
+    store.insert_lead_log(
+        conn,
+        {
+            "message_key": key,
+            "timestamp": now.astimezone().isoformat(),
+            "sender_email": sender,
+            "detected_name": analysis["sender_name"],
+            "service_detected": analysis["service"],
+            "subject": analysis["subject"],
+            "classification": classification,
+        },
+    )
+    outcome = {"request": None, "ticket_id": "", "job_id": None, "job_action": ""}
+    if classification not in ("lead", "review"):
+        return outcome
+
+    request = extract_service_request(
+        analysis["subject"], analysis["body"], analysis["sender_name"], sender, analysis["service"], config
+    )
+    request["timestamp"] = now.astimezone().isoformat()
+    outcome["request"] = request
+
+    if config.get("feature_ticketing", True):
+        store.insert_service_request(
+            conn, {"message_key": key, **{column: request.get(column, "") for column in store.SERVICE_REQUEST_COLUMNS}}
+        )
+        existing_customer = conn.execute("SELECT * FROM customers WHERE email = ?", (sender,)).fetchone() if sender else None
+        incoming_name = normalize_text(f"{request.get('first_name', '')} {request.get('last_name', '')}")
+        existing_name = ""
+        if existing_customer:
+            existing_name = normalize_text(f"{existing_customer.get('first_name') or ''} {existing_customer.get('last_name') or ''}")
+        # Same address but clearly a different person (shared family email): don't merge their jobs.
+        name_matches = not (existing_name and incoming_name and existing_name != incoming_name)
+
+        customer_id = store.upsert_customer(
+            conn, request.get("first_name", ""), request.get("last_name", ""), sender,
+            request.get("phone", ""), request.get("address", ""),
+        )
+        duplicate = (
+            store.find_duplicate_job(
+                conn, customer_id, request.get("issue", ""), request.get("address", ""), request.get("service_detected", "")
+            )
+            if name_matches
+            else None
+        )
+        if duplicate:
+            outcome["job_action"] = store.apply_duplicate(conn, duplicate, request, config["ticket_duplicate_mode"], now)
+            outcome["job_id"] = int(duplicate["job_id"])
+            ticket_id = duplicate.get("ticket_id") or ""
+            if not ticket_id:  # job created before tickets moved to SQLite
+                created = store.parse_iso(duplicate.get("created_at")) or now
+                ticket_id = store.make_ticket_id(int(duplicate["job_id"]), created)
+                conn.execute("UPDATE jobs SET ticket_id = ? WHERE job_id = ?", (ticket_id, duplicate["job_id"]))
+            outcome["ticket_id"] = ticket_id
         else:
-            send_reply(config, follow_up_message)
-            print(f"Sent follow-up to {sender_email}")
+            job_id, ticket_id = store.create_job(conn, customer_id, request, key, now, needs_review=classification == "review")
+            outcome.update(job_id=job_id, ticket_id=ticket_id, job_action="created")
+        request["ticket_id"] = outcome["ticket_id"]
 
-        sender_cooldown[sender_email] = now_utc.isoformat()
-        record["follow_up_sent"] = True
-        record["follow_up_sent_at"] = now_utc.isoformat()
-        follow_ups_sent += 1
-
-    return follow_ups_sent
-
-def process_inbox(config: dict, max_emails: int | None = None, dry_run_override: bool | None = None) -> None:
-    """Execute one full inbox processing cycle (classify, log, reply, persist state)."""
-    processed_path = Path(config["processed_ids_file"])
-    csv_path = Path(config["leads_csv_file"])
-    service_requests_path = Path(str(config.get("service_requests_file", "service_requests.csv")))
-    draft_replies_path = Path(str(config.get("draft_replies_file", "draft_replies.csv")))
-    job_tickets_path = Path(str(config.get("job_tickets_file", "job_tickets.csv")))
-    db_path = Path(str(config.get("db_path", "data/hvac_agent.db")))
-    sender_cooldown_path = Path(config["sender_cooldown_file"])
-    follow_up_state_path = Path(config["follow_up_state_file"])
-    dispatch_state_path = Path(str(config.get("dispatch_summary_state_file", "dispatch_summary_state.json")))
-
-    processed_ids = load_processed_ids(processed_path)
-    sender_cooldown = load_json_dict(sender_cooldown_path)
-    follow_up_state = load_json_dict(follow_up_state_path)
-    dispatch_state = load_dispatch_summary_state(dispatch_state_path)
-    ensure_csv_header(csv_path)
-    ensure_csv_headers(
-        service_requests_path,
-        [
-            "timestamp",
-            "sender_email",
-            "customer_name",
-            "first_name",
-            "last_name",
-            "phone",
-            "address",
-            "maps_link",
-            "issue",
-            "priority",
-            "request_type",
-            "service_detected",
-            "subject",
-        ],
-    )
-    ensure_csv_headers(
-        draft_replies_path,
-        [
-            "timestamp",
-            "sender_email",
-            "draft_subject",
-            "draft_body",
-            "customer_name",
-            "phone",
-            "address",
-            "maps_link",
-            "service_detected",
-            "priority",
-        ],
-    )
-    ensure_csv_headers(
-        job_tickets_path,
-        [
-            "ticket_id",
-            "created_at",
-            "last_updated_at",
-            "occurrence_count",
-            "status",
-            "customer_name",
-            "first_name",
-            "last_name",
-            "sender_email",
-            "address",
-            "maps_link",
-            "issue",
-            "priority",
-            "service_detected",
-            "request_type",
-            "assigned_technician",
-        ],
+    in_hours = is_within_office_hours(config, now)
+    draft_subject, draft_body = generate_draft_reply(config, request, in_hours)
+    store.insert_draft_reply(
+        conn,
+        {
+            "message_key": key,
+            "timestamp": request["timestamp"],
+            "sender_email": sender,
+            "draft_subject": draft_subject,
+            "draft_body": draft_body,
+            "customer_name": request.get("customer_name", ""),
+            "phone": request.get("phone", ""),
+            "address": request.get("address", ""),
+            "maps_link": request.get("maps_link", ""),
+            "service_detected": request.get("service_detected", ""),
+            "priority": request.get("priority", ""),
+        },
     )
 
-    dry_run = config.get("dry_run", True) if dry_run_override is None else dry_run_override
-    database.init_db(db_path)
-
-    with imaplib.IMAP4_SSL(config["imap_server"], int(config["imap_port"])) as imap_conn:
-        imap_conn.login(config["email_address"], config["email_password"])
-        mailbox_name = config.get("mailbox", "INBOX")
-        if config.get("ignore_promotions", True):
-            mailbox_name = "INBOX"
-        if not select_mailbox(imap_conn, mailbox_name):
-            raise RuntimeError(f"Could not select mailbox: {mailbox_name}")
-
-        use_email_followups = (
-            bool(config.get("follow_up_enabled", False))
-            and bool(config.get("feature_follow_up", True))
-            and not bool(config.get("feature_ticketing", True))
-        )
-        follow_ups_sent = (
-            process_follow_up_queue(imap_conn, config, follow_up_state, sender_cooldown, dry_run)
-            if use_email_followups
-            else 0
-        )
-
-        message_nums = fetch_message_ids(imap_conn, unseen_only=bool(config.get("read_unseen_only", True)))
-        if config.get("ignore_promotions", True):
-            message_nums = filter_out_promotions(imap_conn, message_nums)
-        if max_emails is not None:
-            message_nums = message_nums[: max(0, max_emails)]
-
-        print(f"Found {len(message_nums)} email(s) to inspect.")
-
-        processed_count = 0
-        auto_replied_count = 0
-        dispatch_summary_sent_items = 0
-        cooldown_hours = int(config.get("auto_reply_cooldown_hours", 24))
-
-        for msg_num, msg in iter_messages(imap_conn, message_nums):
-            message_id = (msg.get("Message-ID") or f"imap-msg-{msg_num}").strip()
-            if message_id in processed_ids:
-                continue
-
-            subject = clean_subject(msg.get("Subject"))
-            body = extract_plain_text(msg)
-            detected_name, sender_email = extract_sender(msg)
-
-            result = classify(subject, body, config)
-            service = detect_service(subject, body, config)
-            hvac_related = is_hvac_related(subject, body, service)
-            structured_fields = has_structured_fields(body)
-            marketing_email = is_marketing_email(sender_email, subject, body)
-            customer_intent = has_customer_intent(subject, body, structured_fields)
-            if marketing_email and not customer_intent:
-                result = ClassificationResult(
-                    classification="spam",
-                    lead_score=result.lead_score,
-                    existing_score=result.existing_score,
-                    spam_score=max(result.spam_score, result.lead_score + 5),
-                )
-            elif not hvac_related:
-                result = ClassificationResult(
-                    classification="existing",
-                    lead_score=result.lead_score,
-                    existing_score=max(result.existing_score, 1),
-                    spam_score=result.spam_score,
-                )
-            elif (
-                result.classification != "lead"
-                and result.classification != "spam"
-                and structured_fields
-                and not marketing_email
-            ):
-                result = ClassificationResult(
-                    classification="lead",
-                    lead_score=max(result.lead_score, result.existing_score + 1, 1),
-                    existing_score=result.existing_score,
-                    spam_score=result.spam_score,
-                )
-                log_event(
-                    config,
-                    "lead_forced",
-                    sender_email=sender_email,
-                    subject=subject,
-                    reason="structured_fields",
-                )
-
-            now_utc = datetime.now(timezone.utc)
-            timestamp = utc_now_iso()
-            append_csv_row(
-                csv_path,
-                [
-                    timestamp,
-                    sender_email,
-                    detected_name,
-                    service,
-                    subject,
-                    result.classification,
-                ],
+    if config.get("dispatch_summary_enabled", False):
+        if not config.get("feature_ticketing", True) or outcome["job_action"] in {"created", "replaced"}:
+            store.enqueue_dispatch(
+                conn,
+                {
+                    "timestamp": request["timestamp"],
+                    "issue": request.get("issue", "HVAC request"),
+                    "address": request.get("address", "Unknown"),
+                    "priority": request.get("priority", "Normal"),
+                    "request_type": request.get("request_type", "service"),
+                    "service_detected": request.get("service_detected", "Unknown"),
+                    "ticket_id": outcome["ticket_id"],
+                    "maps_link": request.get("maps_link", ""),
+                    "review": classification == "review",
+                },
+                now,
             )
-            log_event(
-                config,
-                "email_processed",
-                sender_email=sender_email,
-                subject=subject,
-                classification=result.classification,
-            )
-            if result.classification != "lead":
-                log_event(
-                    config,
-                    "lead_skipped",
-                    sender_email=sender_email,
-                    subject=subject,
-                    classification=result.classification,
-                    hvac_related=str(hvac_related),
-                    structured_fields=str(structured_fields),
-                    marketing_email=str(marketing_email),
-                    customer_intent=str(customer_intent),
-                )
-
-            should_reply = (
-                config.get("feature_auto_reply", True)
-                and config.get("auto_reply_enabled", True)
-                and result.classification == "lead"
-                and not should_skip_auto_reply(sender_email, msg, config["email_address"])
-            )
-
-            extracted_request: dict | None = None
-            ticket_action = ""
-            ticket_id = ""
-            job_action = ""
-            job_id = ""
-            if result.classification == "lead":
-                extracted_request = extract_service_request(
-                    subject,
-                    body,
-                    detected_name,
-                    sender_email,
-                    service,
-                    config,
-                )
-                log_event(
-                    config,
-                    "lead_parsed",
-                    sender_email=sender_email,
-                    subject=subject,
-                    customer_name=str(extracted_request.get("customer_name", "")),
-                    phone=str(extracted_request.get("phone", "")),
-                    address=str(extracted_request.get("address", "")),
-                    service_detected=str(extracted_request.get("service_detected", "")),
-                )
-
-                if config.get("feature_ticketing", True):
-                    append_csv_row(
-                        service_requests_path,
-                        [
-                            extracted_request["timestamp"],
-                            extracted_request["sender_email"],
-                            extracted_request["customer_name"],
-                            extracted_request["first_name"],
-                            extracted_request["last_name"],
-                            extracted_request["phone"],
-                            extracted_request["address"],
-                            extracted_request["maps_link"],
-                            extracted_request["issue"],
-                            extracted_request["priority"],
-                            extracted_request["request_type"],
-                            extracted_request["service_detected"],
-                            extracted_request["subject"],
-                        ],
-                    )
-
-                    job_ticket = create_job_ticket_from_request(extracted_request, message_id)
-                    ticket_id, ticket_action = upsert_job_ticket(job_tickets_path, job_ticket, config)
-                    extracted_request["ticket_id"] = ticket_id
-                    if ticket_action and ticket_action != "created":
-                        print(f"Ticket {ticket_id} {ticket_action} (duplicate policy).")
-                    elif ticket_action == "created":
-                        log_event(config, "ticket_created", ticket_id=ticket_id, sender_email=sender_email)
-
-                    existing_customer = crm.get_customer_by_email(db_path, extracted_request.get("sender_email", ""))
-                    incoming_name = normalize_text(
-                        f"{extracted_request.get('first_name', '')} {extracted_request.get('last_name', '')}".strip()
-                    )
-                    existing_name = ""
-                    if existing_customer:
-                        existing_name = normalize_text(
-                            f"{existing_customer.get('first_name', '')} {existing_customer.get('last_name', '')}".strip()
-                        )
-                    name_matches = not (existing_name and incoming_name and existing_name != incoming_name)
-
-                    customer_id = crm.upsert_customer(
-                        db_path,
-                        extracted_request.get("first_name", ""),
-                        extracted_request.get("last_name", ""),
-                        extracted_request.get("sender_email", ""),
-                        extracted_request.get("phone", ""),
-                        extracted_request.get("address", ""),
-                    )
-                    duplicate_job = None
-                    if name_matches:
-                        duplicate_job = crm.find_duplicate_job(
-                            db_path,
-                            customer_id,
-                            extracted_request.get("issue", ""),
-                            extracted_request.get("address", ""),
-                            extracted_request.get("service_detected", ""),
-                        )
-                    duplicate_mode = normalize_text(str(config.get("ticket_duplicate_mode", "update"))) or "update"
-                    if duplicate_job and duplicate_mode in {"update", "replace", "delete"}:
-                        crm.update_job_duplicate(
-                            db_path,
-                            int(duplicate_job["job_id"]),
-                            extracted_request.get("issue", ""),
-                            extracted_request.get("priority", "Normal"),
-                            extracted_request.get("service_detected", ""),
-                            extracted_request.get("address", ""),
-                            extracted_request.get("first_name", ""),
-                            extracted_request.get("last_name", ""),
-                            extracted_request.get("phone", ""),
-                        )
-                        job_id = str(duplicate_job["job_id"])
-                        if duplicate_mode == "delete":
-                            job_action = "ignored-duplicate"
-                        elif duplicate_mode == "replace":
-                            job_action = "replaced"
-                        else:
-                            job_action = "updated"
-                    else:
-                        job_id = str(
-                            crm.create_job(
-                                db_path,
-                                customer_id,
-                                extracted_request.get("first_name", ""),
-                                extracted_request.get("last_name", ""),
-                                extracted_request.get("phone", ""),
-                                extracted_request.get("service_detected", ""),
-                                extracted_request.get("issue", ""),
-                                extracted_request.get("priority", "Normal"),
-                                "new",
-                                extracted_request.get("timestamp", utc_now_iso()),
-                                "",
-                                "",
-                                extracted_request.get("timestamp", utc_now_iso()),
-                                1,
-                                extracted_request.get("address", ""),
-                            )
-                        )
-                        job_action = "created"
-
-                    if job_action == "created":
-                        log_event(config, "job_created", job_id=job_id, sender_email=sender_email)
-
-                in_hours_preview = is_within_office_hours(config, now_utc)
-                draft_subject, draft_body = generate_draft_reply(config, extracted_request, in_hours_preview)
-                append_csv_row(
-                    draft_replies_path,
-                    [
-                        extracted_request["timestamp"],
-                        extracted_request["sender_email"],
-                        draft_subject,
-                        draft_body,
-                        extracted_request["customer_name"],
-                        extracted_request["phone"],
-                        extracted_request["address"],
-                        extracted_request["maps_link"],
-                        extracted_request["service_detected"],
-                        extracted_request["priority"],
-                    ],
-                )
-                if config.get("feature_dispatch_summary", True):
-                    if not config.get("feature_ticketing", True):
-                        append_dispatch_pending(dispatch_state, extracted_request)
-                    elif ticket_action in {"created", "replaced"} or job_action == "created":
-                        append_dispatch_pending(dispatch_state, extracted_request)
-
-                if config.get("sms_enabled", False) and config.get("feature_sms_notifications", False):
-                    gateway = str(config.get("sms_gateway_email", "")).strip()
-                    if gateway:
-                        sms_body = (
-                            "NEW HVAC REQUEST\n"
-                            f"Customer: {extracted_request.get('customer_name', '')}\n"
-                            f"Issue: {extracted_request.get('issue', '')}\n"
-                            f"Address: {extracted_request.get('address', '')}\n"
-                            f"Priority: {extracted_request.get('priority', '')}\n"
-                            f"Job ID: {job_id}"
-                        )
-                        if not dry_run:
-                            notifications.send_sms_via_gateway(
-                                config["smtp_server"],
-                                int(config["smtp_port"]),
-                                config["email_address"],
-                                config["email_password"],
-                                gateway,
-                                sms_body,
-                            )
-                        else:
-                            print(f"[DRY RUN] Would send SMS alert to {gateway}.")
-
-            if result.classification == "lead" and use_email_followups:
-                follow_up_name = detected_name
-                if extracted_request and extracted_request.get("customer_name"):
-                    follow_up_name = str(extracted_request.get("customer_name"))
-                register_follow_up_record(
-                    follow_up_state,
-                    message_id,
-                    sender_email,
-                    follow_up_name,
-                    subject,
-                    now_utc,
-                    int(config.get("follow_up_delay_hours", 24)),
-                )
-
-            if should_reply:
-                if in_sender_cooldown(sender_email, sender_cooldown, now_utc, cooldown_hours):
-                    print(f"Skipped auto-reply to {sender_email}: cooldown active ({cooldown_hours}h).")
-                else:
-                    in_hours = is_within_office_hours(config, now_utc)
-                    recipient_name = detected_name
-                    if extracted_request and extracted_request.get("customer_name"):
-                        recipient_name = str(extracted_request.get("customer_name"))
-                    reply = build_ack_message(
-                        config,
-                        sender_email,
-                        recipient_name,
-                        in_hours,
-                        request_details=extracted_request,
-                    )
-                    reply_mode = "in-hours" if in_hours else "after-hours"
-                    if dry_run:
-                        print(f"[DRY RUN] Would send {reply_mode} auto-reply to {sender_email} | Subject: {subject}")
-                    else:
-                        send_reply(config, reply)
-                        print(f"Sent {reply_mode} auto-reply to {sender_email} | Subject: {subject}")
-                        log_event(config, "auto_reply_sent", sender_email=sender_email, mode=reply_mode)
-
-                    sender_cooldown[sender_email] = now_utc.isoformat()
-                    auto_replied_count += 1
-
-            print(
-                f"Processed {sender_email or '<unknown>'} | class={result.classification} "
-                f"(lead={result.lead_score}, existing={result.existing_score}, spam={result.spam_score})"
-            )
-
-            processed_ids.add(message_id)
-            processed_count += 1
-
-        dispatch_summary_sent_items = process_dispatch_summary(config, dispatch_state, dry_run)
-        job_followups_sent = process_job_followups(config, db_path, dry_run)
-        save_processed_ids(processed_path, processed_ids)
-        save_json_dict(sender_cooldown_path, sender_cooldown)
-        save_json_dict(follow_up_state_path, follow_up_state)
-        save_json_dict(dispatch_state_path, dispatch_state)
-
-        print(
-            f"Done. Processed: {processed_count}, Auto-replies: {auto_replied_count}, "
-            f"Follow-ups: {follow_ups_sent}, Job-followups: {job_followups_sent}, "
-            f"Dispatch-items: {dispatch_summary_sent_items}, Dry-run: {dry_run}"
-        )
+    return outcome
 
 
-def process_dispatch_summary(config: dict, dispatch_state: dict, dry_run: bool) -> int:
-    """Send periodic dispatch summaries for newly extracted service requests."""
-    if not bool(config.get("dispatch_summary_enabled", True)) or not bool(config.get("feature_dispatch_summary", True)):
-        return 0
-
-    pending = dispatch_state.get("pending", [])
-    if not pending:
-        return 0
-
-    interval_minutes = int(config.get("dispatch_summary_interval_minutes", 60))
-    now_utc = datetime.now(timezone.utc)
-    last_summary_at = parse_iso_datetime(dispatch_state.get("last_summary_at"))
-    if last_summary_at and now_utc < (last_summary_at + timedelta(minutes=interval_minutes)):
-        return 0
-
-    recipient = str(config.get("dispatch_summary_recipient", config.get("email_address", ""))).strip()
-    if not recipient:
-        return 0
-
-    body = build_dispatch_summary_body(pending)
-    message = EmailMessage()
-    message["Subject"] = f"Dispatch Summary - {system_now().strftime('%Y-%m-%d %H:%M %z')}"
-    message["From"] = config["email_address"]
-    message["To"] = recipient
-    message["X-HVAC-Auto"] = "true"
-    message["X-HVAC-Auto-Type"] = "dispatch_summary"
-    message.set_content(body)
-
-    if dry_run:
-        print(f"[DRY RUN] Would send dispatch summary to {recipient} with {len(pending)} item(s).")
-    else:
-        send_reply(config, message)
-        print(f"Sent dispatch summary to {recipient} with {len(pending)} item(s).")
-
-    append_dispatch_log(Path(str(config.get("dispatch_summary_log_file", "dispatch_summary.log"))), body)
-    dispatch_state["last_summary_at"] = now_utc.isoformat()
-    dispatch_state["pending"] = []
-    return len(pending)
+def _sms_planned(ctx: CycleContext, analysis: dict, now: datetime) -> str:
+    """Return the gateway address if an SMS alert should go out for this email."""
+    config = ctx.config
+    if analysis["classification"] not in ("lead", "review") or not config.get("sms_enabled", False):
+        return ""
+    gateway = str(config.get("sms_gateway_email", "")).strip()
+    if not gateway:
+        return ""
+    cap = int(config.get("max_sms_per_day", 30))
+    if store.count_outbound_since(ctx.conn, ("sms",), now - timedelta(hours=24)) >= cap:
+        log_event(config, "sms_skipped", reason=f"daily SMS cap ({cap}) reached")
+        return ""
+    return gateway
 
 
-def process_job_followups(config: dict, db_path: Path, dry_run: bool) -> int:
-    """Send follow-up emails for jobs not scheduled after threshold."""
-    if (
-        not config.get("feature_follow_up", True)
-        or not config.get("follow_up_enabled", False)
-        or not config.get("feature_ticketing", True)
-    ):
-        return 0
+def process_message(ctx: CycleContext, uid: str) -> None:
+    """Handle one inbound email end to end. Never lets one bad email stop the cycle (AUDIT H6).
 
-    delay_hours = int(config.get("follow_up_delay_hours", 24))
-    threshold = system_now() - timedelta(hours=delay_hours)
-    sent = 0
+    Ordering is what makes this crash-safe (AUDIT C1):
+      1. decide everything in memory;
+      2. if we will send, make sure SMTP is connected (else abort: nothing committed);
+      3. ONE transaction writes every database effect plus the 'pending' send
+         record and the cooldown;
+      4. send; 5. mark done; 6. mark the email read.
+    A crash after step 3 is detected next run ('processing') and never resent.
+    """
+    conn, config, stats = ctx.conn, ctx.config, ctx.stats
+    stats.inspected += 1
+    known = store.find_processed_by_uid(conn, ctx.mailbox_name, ctx.uidvalidity, uid)
+    if known and known["status"] == "done":
+        stats.skipped_known += 1
+        return
 
-    conn = database.get_connection(db_path)
+    raw, received_at = ctx.mbox.fetch(uid)
+    now = ctx.now()
+    msg = message_from_bytes(raw, policy=default)
+    message_id = _one_line(_safe_header(msg, "Message-ID"), 500)
+    # WHY UID+UIDVALIDITY fallback (AUDIT M5): the old fallback was the IMAP
+    # sequence number, which is reused, so later messages were silently skipped.
+    key = message_id or f"uid:{ctx.mailbox_name}:{ctx.uidvalidity}:{uid}"
+    ids = {"message_id": message_id, "mailbox": ctx.mailbox_name, "uidvalidity": ctx.uidvalidity, "uid": uid}
+
+    existing = store.get_processed(conn, key)
+    if existing:
+        if existing["status"] == "done":
+            with store.transaction(conn):
+                store.upsert_processed(conn, key, status="done", now=now, **ids)
+            stats.skipped_known += 1
+            ctx.finish(uid)
+            return
+        if existing["status"] == "processing":
+            store.recover_interrupted_message(conn, key, now)
+            log_event(config, "recovered_interrupted", message_key=key)
+            print(f"Recovered interrupted message {key}: reply outcome unknown, NOT resent.")
+            ctx.finish(uid)
+            return
+        if existing["status"] == "failed" and int(existing.get("attempts") or 0) >= MAX_MESSAGE_ATTEMPTS:
+            stats.skipped_known += 1
+            return
+
     try:
-        rows = conn.execute(
-            """
-            SELECT j.job_id, j.created_at, j.followup_sent_at, c.email, c.first_name, c.phone
-            FROM jobs j
-            JOIN customers c ON c.customer_id = j.customer_id
-            WHERE j.status = 'new'
-              AND (j.followup_sent_at IS NULL OR j.followup_sent_at = '')
-            """
-        ).fetchall()
-        for row in rows:
-            created_at = row.get("created_at") or ""
-            try:
-                created_dt = datetime.fromisoformat(created_at)
-            except ValueError:
-                continue
-            if created_dt.tzinfo is None:
-                created_dt = created_dt.replace(tzinfo=system_now().tzinfo)
-            if created_dt > threshold:
-                continue
+        analysis = analyze_message(msg, config)
+        analysis["date_header"] = message_datetime_utc(msg)
+        sender = analysis["sender_email"]
+        base = {**ids, "sender_email": sender, "subject": analysis["subject"][:300]}
 
-            recipient = str(row.get("email", "")).strip()
-            if not recipient:
-                continue
+        if safety.is_own_message(msg, sender, ctx.own_addresses):
+            # AUDIT C4: our own dispatch summaries/aliases must never become tickets.
+            with store.transaction(conn):
+                store.upsert_processed(conn, key, status="done", now=now, classification="own", note="own/agent mail ignored", **base)
+            stats.ignored_own += 1
+            ctx.finish(uid)
+            return
 
-            name = str(row.get("first_name", "") or "there").strip()
-            follow_up = build_follow_up_message(config, recipient, name)
-            if dry_run:
-                print(f"[DRY RUN] Would send scheduling follow-up to {recipient}")
-            else:
-                send_reply(config, follow_up)
-            conn.execute(
-                "UPDATE jobs SET followup_sent_at = ? WHERE job_id = ?",
-                (utc_now_iso(), row.get("job_id")),
+        block_reason = safety.reply_block_reason(
+            msg, sender, ctx.own_addresses,
+            require_auth=bool(config.get("require_sender_auth", True)),
+            trusted_authserv_ids=list(config.get("trusted_authserv_ids", [])),
+        )
+        send_ack, skip_reason = decide_auto_reply(ctx, analysis, block_reason, received_at, now)
+        sms_gateway = _sms_planned(ctx, analysis, now)
+        if send_ack:
+            ctx.outbox.ensure_ready()  # MailUnavailable propagates: nothing committed yet
+
+        classification = analysis["classification"]
+        reference_time = received_at or analysis["date_header"]
+        max_age = float(config.get("max_reply_age_hours", 48))
+        is_fresh = not (max_age > 0 and reference_time and now - reference_time > timedelta(hours=max_age))
+
+        with store.transaction(conn):
+            outcome = record_message(ctx, key, analysis, now)
+            request = outcome["request"]
+            name = greeting_name(request, analysis["sender_name"])
+            if (
+                classification == "lead"
+                and config.get("follow_up_enabled", False)
+                and block_reason is None
+                and is_fresh
+            ):
+                store.add_follow_up(
+                    conn, key, sender, name, analysis["subject"], outcome["job_id"], now,
+                    float(config.get("follow_up_delay_hours", 24)),
+                )
+            ack_id = sms_id = None
+            if send_ack:
+                store.set_cooldown(conn, sender, now)
+                ack_id = store.add_outbound(conn, "ack", sender, key, now)
+            if sms_gateway:
+                sms_id = store.add_outbound(conn, "sms", sms_gateway, key, now)
+            store.upsert_processed(
+                conn, key, status="processing" if (ack_id or sms_id) else "done", now=now,
+                classification=classification, attempts_increment=1, error="", **base,
             )
-            conn.commit()
-            sent += 1
-    finally:
-        conn.close()
 
+        stats.processed += 1
+        stats.by_class[classification] = stats.by_class.get(classification, 0) + 1
+        log_event(
+            config, "email_processed", sender_email=sender, subject=analysis["subject"], classification=classification,
+            ticket_id=outcome["ticket_id"], job_action=outcome["job_action"],
+            auto_reply="planned" if send_ack else f"skipped: {skip_reason}",
+        )
+
+        if ack_id:
+            ack = build_ack_message(
+                config, sender, name, is_within_office_hours(config, now), outcome["ticket_id"], original=msg
+            )
+            if ctx.outbox.deliver(ack_id, ack, now):
+                stats.auto_replies += 1
+                log_event(config, "auto_reply_sent", sender_email=sender, dry_run=str(ctx.dry_run))
+        if sms_id:
+            sms = EmailMessage()
+            sms["Subject"] = ""
+            sms["From"] = config["email_address"]
+            sms["To"] = sms_gateway
+            mark_automatic(sms, "sms")
+            sms.set_content(
+                ("REVIEW " if classification == "review" else "") + "NEW HVAC REQUEST\n"
+                f"Ticket: {outcome['ticket_id']}\n"
+                f"Priority: {(request or {}).get('priority', '')}\n"
+                f"Service: {(request or {}).get('service_detected', '')}"
+            )
+            ctx.outbox.deliver(sms_id, sms, now)
+        if ack_id or sms_id:
+            with store.transaction(conn):
+                store.upsert_processed(conn, key, status="done", now=now, **ids)
+        print(
+            f"Processed {sender or '<unknown>'} | class={classification} "
+            f"(lead={analysis['result'].lead_score}, existing={analysis['result'].existing_score}, "
+            f"spam={analysis['result'].spam_score}) | reply={'yes' if send_ack else 'no: ' + skip_reason}"
+        )
+        ctx.finish(uid)
+    except MailUnavailable:
+        raise
+    except Exception as err:
+        append_error_log(config, f"message failed (key={key})", err)
+        with store.transaction(conn):
+            store.upsert_processed(
+                conn, key, status="failed", now=now, error=f"{type(err).__name__}: {err}"[:500],
+                attempts_increment=1, **ids,
+            )
+        stats.failed += 1
+        print(f"Error processing message {key}; details in {config.get('error_log_file')}. Continuing with the next one.")
+
+
+def process_follow_ups(ctx: CycleContext) -> int:
+    """Send due follow-ups, with the same safety rules as acknowledgments (AUDIT H2).
+
+    A follow-up only exists for a lead that passed the reply-safety checks
+    when it arrived, while follow-ups were enabled. Before sending we cancel it
+    if staff replied manually (Sent folder), the job moved past 'new', or it
+    is more than 48h overdue (agent was offline: no burst of stale emails).
+    If the Sent folder can't be read we hold everything rather than guess.
+    """
+    conn, config = ctx.conn, ctx.config
+    now = ctx.now()
+    with store.transaction(conn):
+        store.recover_interrupted_follow_ups(conn, now)
+        if not config.get("follow_up_enabled", False):
+            # Turning the feature off cancels the queue, so turning it back on
+            # later can never mail old leads in one burst.
+            store.cancel_all_pending_follow_ups(conn, now, "follow-ups disabled")
+            return 0
+    due = store.due_follow_ups(conn, now)
+    if not due:
+        return 0
+
+    earliest = min(store.parse_iso(row["lead_at"]) or now for row in due)
+    candidates = [str(config.get("sent_mailbox", ""))] + SENT_MAILBOX_FALLBACKS
+    try:
+        manual = ctx.mbox.sent_recipients_since(candidates, earliest, safety.own_raw_addresses(config))
+    except Exception as err:
+        append_error_log(config, "reading Sent folder for follow-ups", err)
+        manual = None
+    if manual is None:
+        print("Follow-ups paused: could not read the Sent folder to check for manual replies.")
+        log_event(config, "follow_ups_paused", reason="sent folder unavailable")
+        return 0
+
+    sent = 0
+    cap = int(config.get("max_auto_emails_per_day", 50))
+    for row in due:
+        key, sender = row["message_key"], row["sender_email"]
+        lead_at = store.parse_iso(row["lead_at"]) or now
+        due_at = store.parse_iso(row["due_at"]) or now
+
+        def cancel(reason: str) -> None:
+            with store.transaction(conn):
+                store.set_follow_up_status(conn, key, "cancelled", now, reason)
+
+        manual_at = manual.get(sender)
+        if manual_at and manual_at >= lead_at:
+            cancel("manual reply detected")
+            continue
+        if row.get("job_id") and config.get("feature_ticketing", True):
+            job = store.get_job(conn, int(row["job_id"]))
+            if job is None or str(job.get("status", "")).lower() != "new":
+                cancel("job already being handled")
+                continue
+        if now - due_at > timedelta(hours=FOLLOW_UP_GRACE_HOURS):
+            cancel(f"more than {FOLLOW_UP_GRACE_HOURS}h overdue")
+            continue
+        if store.in_cooldown(conn, sender, now, float(config.get("auto_reply_cooldown_hours", 24))):
+            continue  # stays pending; retried next cycle
+        if store.count_outbound_since(conn, AUTO_EMAIL_KINDS, now - timedelta(hours=24)) >= cap:
+            print(f"Follow-ups held: daily auto-email cap ({cap}) reached.")
+            break
+        try:
+            ctx.outbox.ensure_ready()
+        except MailUnavailable as err:
+            print(f"Follow-ups held: {err}")
+            break
+        with store.transaction(conn):
+            outbound_id = store.add_outbound(conn, "follow_up", sender, key, now)
+            store.set_cooldown(conn, sender, now)
+            store.set_follow_up_status(conn, key, "sending", now, outbound_id=outbound_id)
+        delivered = ctx.outbox.deliver(outbound_id, build_follow_up_message(config, sender, row.get("recipient_name") or ""), now)
+        with store.transaction(conn):
+            store.set_follow_up_status(conn, key, "sent" if delivered else "cancelled", now, "" if delivered else "send failed")
+            if delivered and row.get("job_id"):
+                store.mark_job_followup_sent(conn, int(row["job_id"]), now)
+        if delivered:
+            sent += 1
+            log_event(config, "follow_up_sent", sender_email=sender, dry_run=str(ctx.dry_run))
     return sent
 
 
-def calculate_dashboard_metrics(config: dict) -> dict[str, int]:
-    """Calculate lightweight dashboard counters from CSV outputs."""
-    leads_path = Path(str(config.get("leads_csv_file", "data/hvac_leads.csv")))
-    service_path = Path(str(config.get("service_requests_file", "data/service_requests.csv")))
-    tickets_path = Path(str(config.get("job_tickets_file", "job_tickets.csv")))
-    db_path = Path(str(config.get("db_path", "data/hvac_agent.db")))
-    today = datetime.now(timezone.utc).date()
-    database.init_db(db_path)
+def process_dispatch_summary(ctx: CycleContext) -> int:
+    """Send the periodic dispatch summary to staff.
 
+    Unlike customer email, an internal summary that might be duplicated after
+    a crash is retried rather than dropped: staff missing a job is worse.
+    """
+    conn, config = ctx.conn, ctx.config
+    if not config.get("dispatch_summary_enabled", False):
+        return 0
+    now = ctx.now()
+    with store.transaction(conn):
+        store.release_stale_dispatch_claims(conn, now)
+    last = store.parse_iso(store.get_meta(conn, "dispatch_last_summary_at"))
+    interval = timedelta(minutes=int(config.get("dispatch_summary_interval_minutes", 60)))
+    if last and now < last + interval:
+        return 0
+    if not conn.execute("SELECT 1 FROM dispatch_queue WHERE status = 'pending' LIMIT 1").fetchone():
+        return 0
+    recipient = str(config.get("dispatch_summary_recipient") or config.get("email_address", "")).strip()
+    if not recipient:
+        return 0
+    try:
+        ctx.outbox.ensure_ready()
+    except MailUnavailable as err:
+        print(f"Dispatch summary held: {err}")
+        return 0
+
+    with store.transaction(conn):
+        rows = store.claim_pending_dispatch(conn, now)
+        outbound_id = store.add_outbound(conn, "dispatch", recipient, "", now)
+    items = [json.loads(row["payload"]) for row in rows]
+    body = build_dispatch_summary_body(items)
+    message = EmailMessage()
+    message["Subject"] = f"Dispatch Summary - {now.astimezone().strftime('%Y-%m-%d %H:%M %z')}"
+    message["From"] = config["email_address"]
+    message["To"] = recipient
+    mark_automatic(message, "dispatch")
+    message.set_content(body)
+
+    delivered = ctx.outbox.deliver(outbound_id, message, now)
+    with store.transaction(conn):
+        store.finish_dispatch(conn, [row["id"] for row in rows], now, sent=delivered)
+        if delivered:
+            store.set_meta(conn, "dispatch_last_summary_at", store.iso(now))
+    if delivered and not ctx.dry_run:
+        append_dispatch_log(Path(str(config.get("dispatch_summary_log_file", "logs/dispatch_summary.log"))), body)
+    return len(items) if delivered else 0
+
+
+def process_inbox(
+    config: dict,
+    max_emails: int | None = None,
+    dry_run_override: bool | None = None,
+    *,
+    mailbox_factory=None,
+    smtp_factory=None,
+    now_fn=None,
+) -> CycleStats:
+    """Run one full cycle: new mail, follow-ups, dispatch summary, CSV export.
+
+    mailbox_factory / smtp_factory / now_fn exist so tests can run the real
+    logic against fake mail servers and a fake clock (no network).
+    """
+    dry_run = resolve_dry_run(config, dry_run_override)
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    db_path = Path(str(config["db_path"]))
+    conn = store.open_dry_run_copy(db_path) if dry_run else store.open_state_db(db_path)
+    smtp = None
+    try:
+        if dry_run:
+            if not store.get_meta(conn, legacy_import.META_KEY):
+                print("[DRY RUN] Older state files have not been imported yet; the first live run will import them.")
+        else:
+            backup = legacy_import.import_legacy_state_once(conn, config, Path("backups"), now_fn())
+            if backup:
+                print(f"Imported older state files into the database (backup: {backup}).")
+                log_event(config, "legacy_state_imported", backup=backup)
+
+        password = credentials.resolve_mail_password(config)
+        smtp = None if dry_run else (smtp_factory or default_smtp_factory)(config, password)
+        outbox = Outbox(conn, smtp, dry_run)
+        stats = CycleStats(dry_run=dry_run)
+        # AUDIT M4: the configured mailbox is honoured (ignore_promotions used to
+        # force INBOX, and its Gmail-category filter never worked).
+        mailbox_name = str(config.get("mailbox") or "INBOX")
+
+        with (mailbox_factory or default_mailbox_factory)(config, password) as mbox:
+            # readonly in dry-run: the server will not let us change flags.
+            uidvalidity = mbox.select(mailbox_name, readonly=dry_run)
+            uids = mbox.search_uids(unseen_only=bool(config.get("read_unseen_only", True)))
+            if max_emails is not None:
+                uids = uids[: max(0, max_emails)]
+            print(f"Found {len(uids)} email(s) to inspect.")
+            ctx = CycleContext(
+                config=config, conn=conn, mbox=mbox, outbox=outbox, dry_run=dry_run,
+                mailbox_name=mailbox_name, uidvalidity=uidvalidity,
+                own_addresses=safety.own_address_set(config), stats=stats, now=now_fn,
+            )
+            for uid in uids:
+                process_message(ctx, uid)
+            stats.follow_ups = process_follow_ups(ctx)
+            stats.dispatch_items = process_dispatch_summary(ctx)
+
+        if not dry_run:
+            for failure in store.export_csvs(conn, csv_export_paths(config)):
+                print(f"WARNING: CSV export failed ({failure}). Close the file if it is open in Excel.")
+                log_event(config, "csv_export_failed", detail=failure)
+
+        print(
+            f"Done. New: {stats.processed}, Already handled: {stats.skipped_known}, Own mail ignored: {stats.ignored_own}, "
+            f"Failed: {stats.failed}, Auto-replies: {stats.auto_replies}, Follow-ups: {stats.follow_ups}, "
+            f"Dispatch-items: {stats.dispatch_items}, Dry-run: {dry_run}"
+        )
+        return stats
+    finally:
+        if smtp is not None:
+            smtp.close()
+        conn.close()
+
+
+def calculate_dashboard_metrics(config: dict) -> dict[str, int]:
+    """Dashboard counters, read from SQLite (the single source of truth, AUDIT M1).
+
+    Uses a read-only connection so the 5-second UI refresh never writes to the
+    database or competes with the agent for the write lock (AUDIT L5).
+    """
     metrics = {
         "emails_processed_today": 0,
         "service_requests_today": 0,
@@ -2521,75 +2169,55 @@ def calculate_dashboard_metrics(config: dict) -> dict[str, int]:
         "leads_this_week": 0,
         "avg_response_minutes": 0,
     }
+    conn = store.open_readonly(Path(str(config.get("db_path", "data/hvac_agent.db"))))
+    if conn is None:
+        return metrics
+    # Everything is compared in the office's local calendar (AUDIT L6).
+    local_now = system_now()
+    today = local_now.date()
+    week_start = today - timedelta(days=today.weekday())
 
-    if leads_path.exists() and leads_path.stat().st_size > 0:
-        with leads_path.open("r", encoding="utf-8", newline="") as f:
-            for row in csv.DictReader(f):
-                parsed_ts = parse_iso_datetime(row.get("timestamp"))
-                if not parsed_ts or parsed_ts.date() != today:
-                    continue
-                metrics["emails_processed_today"] += 1
-                if str(row.get("classification", "")).strip().lower() == "spam":
-                    metrics["spam_today"] += 1
+    def local_date(value: object):
+        parsed = parse_iso_datetime(str(value or ""))
+        return parsed.astimezone().date() if parsed else None
 
-    if service_path.exists() and service_path.stat().st_size > 0:
-        with service_path.open("r", encoding="utf-8", newline="") as f:
-            for row in csv.DictReader(f):
-                parsed_ts = parse_iso_datetime(row.get("timestamp"))
-                if not parsed_ts or parsed_ts.date() != today:
-                    continue
-                req_type = str(row.get("request_type", "")).strip().lower()
-                if req_type == "quote":
-                    metrics["quotes_today"] += 1
-                else:
-                    metrics["service_requests_today"] += 1
-
-    if db_path.exists():
-        conn = database.get_connection(db_path)
-        try:
-            rows = conn.execute(
-                "SELECT created_at, scheduled_time, status, priority FROM jobs"
-            ).fetchall()
+    try:
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "lead_log" in tables:
+            for row in conn.execute("SELECT timestamp, classification FROM lead_log"):
+                if local_date(row["timestamp"]) == today:
+                    metrics["emails_processed_today"] += 1
+                    if str(row["classification"]).lower() == "spam":
+                        metrics["spam_today"] += 1
+        if "service_requests" in tables:
+            for row in conn.execute("SELECT timestamp, request_type FROM service_requests"):
+                if local_date(row["timestamp"]) == today:
+                    key = "quotes_today" if str(row["request_type"]).lower() == "quote" else "service_requests_today"
+                    metrics[key] += 1
+        if "jobs" in tables:
             response_minutes: list[int] = []
-            for row in rows:
-                created_at = row.get("created_at") or ""
-                status = str(row.get("status", "")).lower()
-                priority = str(row.get("priority", "")).lower()
-                try:
-                    created_dt = datetime.fromisoformat(created_at)
-                except ValueError:
-                    continue
-                if created_dt.date() == today and status == "completed":
-                    metrics["jobs_completed_today"] += 1
-                if status in {"new", "scheduled", "in progress"}:
+            for row in conn.execute("SELECT created_at, scheduled_time, status, priority, last_updated_at FROM jobs"):
+                created = parse_iso_datetime(row.get("created_at") or "")
+                status = str(row.get("status") or "").lower()
+                if status in OPEN_STATUSES:
                     metrics["open_tickets"] += 1
-                    if priority == "high":
+                    if str(row.get("priority") or "").lower() == "high":
                         metrics["high_priority_open_tickets"] += 1
-                week_start = (system_now().date() - timedelta(days=system_now().weekday()))
-                if created_dt.date() >= week_start:
+                if status == "completed" and local_date(row.get("last_updated_at")) == today:
+                    metrics["jobs_completed_today"] += 1
+                if created and created.astimezone().date() >= week_start:
                     metrics["leads_this_week"] += 1
-                scheduled_time = row.get("scheduled_time") or ""
-                if scheduled_time:
-                    try:
-                        scheduled_dt = datetime.fromisoformat(scheduled_time)
-                        response_minutes.append(int((scheduled_dt - created_dt).total_seconds() // 60))
-                    except ValueError:
-                        pass
+                scheduled = parse_iso_datetime(row.get("scheduled_time") or "")
+                if created and scheduled:
+                    response_minutes.append(int((scheduled - created).total_seconds() // 60))
             if response_minutes:
                 metrics["avg_response_minutes"] = int(sum(response_minutes) / len(response_minutes))
-        finally:
-            conn.close()
-    elif tickets_path.exists() and tickets_path.stat().st_size > 0:
-        with tickets_path.open("r", encoding="utf-8", newline="") as f:
-            for row in csv.DictReader(f):
-                status = str(row.get("status", "")).strip().lower()
-                if status != "open":
-                    continue
-                metrics["open_tickets"] += 1
-                if str(row.get("priority", "")).strip().lower() == "high":
-                    metrics["high_priority_open_tickets"] += 1
-
+    finally:
+        conn.close()
     return metrics
+
+
+OPEN_STATUSES = {"new", "scheduled", "in progress"}
 
 
 def get_recent_open_tickets(config: dict, limit: int = 8) -> list[str]:
@@ -2688,7 +2316,9 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
     style.map("TNotebook.Tab", background=[("selected", accent_color)])
 
     db_path = Path(str(config.get("db_path", "data/hvac_agent.db")))
-    database.init_db(db_path)
+    # Create/upgrade the schema once at startup (adds the Phase 1 tables).
+    store.open_state_db(db_path).close()
+    agent_lock = InstanceLock(lock_path_for(config))
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
@@ -2828,25 +2458,51 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
         root.after(refresh_seconds * 1000, update_metrics)
 
     def worker_loop() -> None:
-        runtime_state["status"] = "Running"
-        while not stop_event.is_set():
-            try:
-                if not has_email_credentials(config):
-                    runtime_state["status"] = "Needs sign-in"
-                    stop_event.wait(poll_interval)
-                    continue
-                process_inbox(config, dry_run_override=dry_run)
-                runtime_state["last_checked"] = system_now().strftime("%Y-%m-%d %H:%M")
-                runtime_state["status"] = "Running OK"
-            except Exception as err:
-                append_error_log(config, "ui worker cycle failure", err)
-                runtime_state["status"] = "Error (check error.log)"
-            stop_event.wait(poll_interval)
-        runtime_state["status"] = "Stopped"
+        runtime_state["status"] = "Running (dry-run)" if dry_run else "Running"
+        failures = 0
+        try:
+            while not stop_event.is_set():
+                auth_failure = False
+                try:
+                    if not has_email_credentials(config):
+                        runtime_state["status"] = "Needs sign-in"
+                        stop_event.wait(poll_interval)
+                        continue
+                    process_inbox(config, dry_run_override=dry_run)
+                    failures = 0
+                    runtime_state["last_checked"] = system_now().strftime("%Y-%m-%d %H:%M")
+                    runtime_state["status"] = "Running OK (dry-run)" if dry_run else "Running OK"
+                except MailAuthError as err:
+                    failures += 1
+                    auth_failure = True
+                    append_error_log(config, "ui worker: mailbox login rejected", err)
+                    runtime_state["status"] = "Login rejected - run setup again"
+                except MailUnavailable as err:
+                    failures += 1
+                    append_error_log(config, "ui worker: mail server unavailable", err)
+                    runtime_state["status"] = "Mail server unreachable - retrying"
+                except Exception as err:
+                    failures += 1
+                    append_error_log(config, "ui worker cycle failure", err)
+                    runtime_state["status"] = "Error (check error.log)"
+                # Back off on repeated failures instead of hammering the server (AUDIT H10).
+                stop_event.wait(backoff_seconds(poll_interval, failures, auth_failure))
+        finally:
+            agent_lock.release()
+            runtime_state["status"] = "Stopped"
 
     def start_agent() -> None:
         thread = worker_ref.get("thread")
         if thread and thread.is_alive():
+            return
+        # AUDIT C3: refuse to start if the background task (or another UI)
+        # is already processing this mailbox.
+        if not dry_run and not agent_lock.acquire():
+            messagebox.showerror(
+                "Already running",
+                "Another copy of the HVAC agent is already processing this mailbox "
+                "(the background task or another window). Stop it before starting here.",
+            )
             return
         stop_event.clear()
         new_thread = threading.Thread(target=worker_loop, daemon=True)
@@ -2866,20 +2522,41 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
     def toggle_fullscreen() -> None:
         set_fullscreen(not fullscreen_state["enabled"])
 
+    toggle_guard = {"busy": False}
+
     def save_feature_toggles() -> None:
+        if toggle_guard["busy"]:
+            return
         auto_reply_enabled = bool(feature_auto_reply.get())
-        config["feature_auto_reply"] = auto_reply_enabled
-        config["auto_reply_enabled"] = auto_reply_enabled
-        config["feature_ticketing"] = bool(feature_ticketing.get())
-        config["feature_dispatch_summary"] = bool(feature_dispatch.get())
-        sms_enabled = bool(feature_sms.get())
-        config["feature_sms_notifications"] = sms_enabled
-        config["sms_enabled"] = sms_enabled
-        followup_enabled = bool(feature_followup.get())
-        config["feature_follow_up"] = followup_enabled
-        config["follow_up_enabled"] = followup_enabled
-        Path(config.get("config_path", "config.json")).write_text(json.dumps(config, indent=2), encoding="utf-8")
-        # No popup; auto-save silently.
+        if auto_reply_enabled and not config.get("auto_reply_enabled", False) and not dry_run:
+            # AUDIT M12: one click used to start emailing real customers immediately.
+            confirmed = messagebox.askyesno(
+                "Turn on auto-replies?",
+                "The agent is in LIVE mode. Turning this on sends acknowledgment emails to real customers.\n\nContinue?",
+            )
+            if not confirmed:
+                toggle_guard["busy"] = True
+                feature_auto_reply.set(False)
+                toggle_guard["busy"] = False
+                return
+        # Both the canonical and the legacy key are written so they can never disagree.
+        updates = {
+            "auto_reply_enabled": auto_reply_enabled,
+            "feature_auto_reply": auto_reply_enabled,
+            "feature_ticketing": bool(feature_ticketing.get()),
+            "dispatch_summary_enabled": bool(feature_dispatch.get()),
+            "feature_dispatch_summary": bool(feature_dispatch.get()),
+            "sms_enabled": bool(feature_sms.get()),
+            "feature_sms_notifications": bool(feature_sms.get()),
+            "follow_up_enabled": bool(feature_followup.get()),
+            "feature_follow_up": bool(feature_followup.get()),
+        }
+        config.update(updates)
+        try:
+            patch_config_file(Path(config.get("config_path", "config.json")), updates)
+        except Exception as err:
+            append_error_log(config, "saving feature toggles", err)
+            messagebox.showerror("Could not save settings", f"The change is active now but was not saved to config.json:\n{err}")
 
     def auto_save_toggle(*_args: object) -> None:
         save_feature_toggles()
@@ -3404,8 +3081,11 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
     reset_state = {"armed": False}
 
     def perform_full_reset() -> None:
-        stop_event.set()
-        runtime_state["status"] = "Stopped"
+        thread = worker_ref.get("thread")
+        if thread and thread.is_alive():
+            # Deleting the database under a running cycle would lose its writes.
+            messagebox.showwarning("Agent running", "Press Stop and wait until the status shows Stopped, then reset.")
+            return
         data_paths = [
             db_path,
             Path(str(config.get("leads_csv_file", "data/hvac_leads.csv"))),
@@ -3424,6 +3104,14 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
         if wal_path:
             data_paths.extend([Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")])
 
+        # AUDIT H7: always back up first; if the backup fails, delete nothing.
+        try:
+            backup_dir = backup_paths(data_paths, Path("backups"), "ui-reset")
+        except Exception as err:
+            append_error_log(config, "reset backup failed", err)
+            messagebox.showerror("Reset cancelled", f"Could not back up the data first, so nothing was deleted.\n\n{err}")
+            return
+
         for path in data_paths:
             try:
                 if path.exists():
@@ -3431,9 +3119,10 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
             except OSError:
                 continue
 
-        database.init_db(db_path)
+        store.open_state_db(db_path).close()
         refresh_ticket_cards(force=True)
         refresh_history_tree()
+        messagebox.showinfo("Reset complete", f"All data was cleared. A backup was saved to:\n{backup_dir}")
 
     def reset_button_click() -> None:
         if not reset_state["armed"]:
@@ -3469,6 +3158,19 @@ def run_ui(config: dict, dry_run_override: bool | None = None) -> None:
     root.mainloop()
 
 
+def backoff_seconds(poll_interval: int, consecutive_failures: int, auth_failure: bool) -> int:
+    """How long to wait after failures (AUDIT H10).
+
+    Doubles per consecutive failure, capped at 15 min (30 min for a rejected
+    login, so a wrong password doesn't hammer the provider and risk a lockout).
+    """
+    base = max(5, int(poll_interval))
+    if consecutive_failures <= 0:
+        return base
+    cap = 1800 if auth_failure else 900
+    return min(cap, base * (2 ** min(consecutive_failures, 10)))
+
+
 def run_agent(
     config: dict,
     max_emails: int | None = None,
@@ -3476,8 +3178,8 @@ def run_agent(
     daemon: bool = False,
     poll_interval_override: int | None = None,
 ) -> None:
-    """Run one-shot or daemonized agent loop with heartbeat and error capture."""
-    dry_run = config.get("dry_run", True) if dry_run_override is None else dry_run_override
+    """Run one-shot or daemonized agent loop with heartbeat, backoff and error capture."""
+    dry_run = resolve_dry_run(config, dry_run_override)
     poll_interval = int(config.get("poll_interval_seconds", 30))
     if poll_interval_override is not None:
         poll_interval = max(5, poll_interval_override)
@@ -3487,29 +3189,57 @@ def run_agent(
     if daemon and heartbeat_minutes > 0:
         next_heartbeat = datetime.now(timezone.utc) + timedelta(minutes=heartbeat_minutes)
 
+    # AUDIT C3: only one live agent per data folder. Dry-run works on an
+    # in-memory copy and changes nothing, so it may run alongside.
+    lock = InstanceLock(lock_path_for(config))
+    if not dry_run and not lock.acquire():
+        raise AlreadyRunningError(
+            "Another HVAC agent (background task or the UI's Start button) is already running "
+            "for this data folder. Stop it first."
+        )
+
     mode = "daemon" if daemon else "one-shot"
     print(f"Agent started at {utc_now_iso()} | mode={mode} | dry_run={dry_run}")
+    failures = 0
+    try:
+        while True:
+            auth_failure = False
+            try:
+                process_inbox(config, max_emails=max_emails, dry_run_override=dry_run_override)
+                failures = 0
+            except KeyboardInterrupt:
+                print("Agent stopped by user.")
+                raise
+            except MailAuthError as err:
+                failures += 1
+                auth_failure = True
+                append_error_log(config, "mailbox login rejected", err)
+                print("Mailbox login was rejected. Check the email address / app password (run --quick-setup).")
+                log_event(config, "error", context="login", error=str(err))
+            except MailUnavailable as err:
+                failures += 1
+                print(f"Mail server unavailable: {err}")
+                log_event(config, "error", context="network", error=str(err))
+            except Exception as err:
+                failures += 1
+                append_error_log(config, "process_inbox failure", err)
+                print(f"Error encountered. Details written to {config.get('error_log_file', 'error.log')}")
+                log_event(config, "error", context="process_inbox", error=str(err))
 
-    while True:
-        try:
-            process_inbox(config, max_emails=max_emails, dry_run_override=dry_run_override)
-        except KeyboardInterrupt:
-            print("Agent stopped by user.")
-            raise
-        except Exception as err:
-            append_error_log(config, "process_inbox failure", err)
-            print(f"Error encountered. Details written to {config.get('error_log_file', 'error.log')}")
-            log_event(config, "error", context="process_inbox", error=str(err))
+            if not daemon:
+                return
 
-        if not daemon:
-            return
+            now_utc = datetime.now(timezone.utc)
+            if next_heartbeat and now_utc >= next_heartbeat:
+                print(f"Agent heartbeat at {utc_now_iso()} | waiting for next poll")
+                next_heartbeat = now_utc + timedelta(minutes=heartbeat_minutes)
 
-        now_utc = datetime.now(timezone.utc)
-        if next_heartbeat and now_utc >= next_heartbeat:
-            print(f"Agent heartbeat at {utc_now_iso()} | waiting for next poll")
-            next_heartbeat = now_utc + timedelta(minutes=heartbeat_minutes)
-
-        time_module.sleep(max(5, poll_interval))
+            delay = backoff_seconds(poll_interval, failures, auth_failure)
+            if failures:
+                print(f"Retrying in {delay}s ({failures} consecutive failure(s)).")
+            time_module.sleep(delay)
+    finally:
+        lock.release()
 
 
 def run_demo(config: dict) -> None:
@@ -3698,13 +3428,11 @@ def run_setup(config_path: Path) -> None:
         bool(config.get("license_enforcement", True)),
     )
 
-    current_password = str(config.get("email_password", ""))
     password_hint = "(hidden; press Enter to keep current)"
     password_value = getpass.getpass(f"Email app password {password_hint}: ").replace(" ", "").strip()
-    if password_value:
-        config["email_password"] = password_value
-    elif not current_password:
-        config["email_password"] = "replace-with-app-password"
+    store_mail_password(config, password_value)
+    if not credentials.has_credentials(config):
+        print("WARNING: no mailbox password is saved yet; the agent cannot sign in until you run setup again.")
 
     config["auto_reply_enabled"] = prompt_bool("Enable auto-replies", bool(config.get("auto_reply_enabled", False)))
     config["feature_auto_reply"] = bool(config["auto_reply_enabled"])
@@ -3832,7 +3560,6 @@ def run_setup_gui(config_path: Path) -> None:
         config["default_service_area"] = service_area_var.get().strip()
         config["dispatcher_phone"] = dispatcher_phone_var.get().strip()
         config["email_address"] = gmail
-        config["email_password"] = app_password
         config["imap_server"] = imap_server_var.get().strip() or "imap.gmail.com"
         config["imap_port"] = int(imap_port_var.get().strip() or 993)
         config["smtp_server"] = smtp_server_var.get().strip() or "smtp.gmail.com"
@@ -3851,16 +3578,21 @@ def run_setup_gui(config_path: Path) -> None:
             return
 
         try:
-            with imaplib.IMAP4_SSL(config["imap_server"], int(config["imap_port"])) as imap_conn:
-                imap_conn.login(config["email_address"], config["email_password"])
-        except imaplib.IMAP4.error:
+            with ImapMailbox(config["imap_server"], int(config["imap_port"]), gmail, app_password, timeout=20):
+                pass
+        except MailAuthError:
             messagebox.showerror("Wrong Password", "Could not sign in. Check Gmail and app password.")
             return
-        except Exception:
+        except MailUnavailable:
             messagebox.showerror("Connection Error", "Could not reach Gmail. Check your internet connection.")
             return
 
-        targets = write_config_files(config, config_path)
+        try:
+            store_mail_password(config, app_password)
+        except credentials.CredentialError as err:
+            messagebox.showerror("Could not save password", str(err))
+            return
+        write_config_files(config, config_path)
         write_license_binding(config)
         # No popups for setup completion.
         root.destroy()
@@ -3909,8 +3641,7 @@ def run_quick_setup(config_path: Path) -> None:
     config["business_name"] = business_name
     config["phone_number"] = phone_number
     config["email_address"] = gmail_address
-    if gmail_password:
-        config["email_password"] = gmail_password
+    store_mail_password(config, gmail_password)
     config["imap_server"] = "imap.gmail.com"
     config["imap_port"] = 993
     config["smtp_server"] = "smtp.gmail.com"
@@ -3924,7 +3655,7 @@ def run_quick_setup(config_path: Path) -> None:
 
     targets = write_config_files(config, config_path)
     write_license_binding(config)
-    print("Saved quick setup to:")
+    print("Saved quick setup to (password stored in Windows Credential Manager):")
     for path in targets:
         print(f"  {path}")
 
@@ -4019,7 +3750,6 @@ def run_quick_setup_gui(config_path: Path) -> None:
         config["business_name"] = business_name
         config["phone_number"] = phone_number
         config["email_address"] = gmail
-        config["email_password"] = app_password
         config["imap_server"] = "imap.gmail.com"
         config["imap_port"] = 993
         config["smtp_server"] = "smtp.gmail.com"
@@ -4037,16 +3767,21 @@ def run_quick_setup_gui(config_path: Path) -> None:
             return
 
         try:
-            with imaplib.IMAP4_SSL(config["imap_server"], int(config["imap_port"])) as imap_conn:
-                imap_conn.login(config["email_address"], config["email_password"])
-        except imaplib.IMAP4.error:
+            with ImapMailbox(config["imap_server"], int(config["imap_port"]), gmail, app_password, timeout=20):
+                pass
+        except MailAuthError:
             messagebox.showerror("Wrong Password", "Could not sign in. Check Gmail and app password.")
             return
-        except Exception:
+        except MailUnavailable:
             messagebox.showerror("Connection Error", "Could not reach Gmail. Check your internet connection.")
             return
 
-        targets = write_config_files(config, config_path)
+        try:
+            store_mail_password(config, app_password)
+        except credentials.CredentialError as err:
+            messagebox.showerror("Could not save password", str(err))
+            return
+        write_config_files(config, config_path)
         write_license_binding(config)
         # No popups for setup completion.
         root.destroy()
@@ -4147,8 +3882,13 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         pass
+    except (ConfigError, AlreadyRunningError, credentials.CredentialError, legacy_import.LegacyImportError) as err:
+        # Expected, actionable problems: say exactly what to fix, no traceback.
+        print(f"Cannot start: {err}")
+        append_error_log({"error_log_file": "logs/error.log"}, "startup refused", err)
+        raise SystemExit(2)
     except Exception as err:
-        fallback_config = {"error_log_file": "error.log"}
+        fallback_config = {"error_log_file": "logs/error.log"}
         if config_path.exists():
             try:
                 raw = json.loads(config_path.read_text(encoding="utf-8"))
