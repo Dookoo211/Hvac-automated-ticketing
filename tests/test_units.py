@@ -68,7 +68,7 @@ def test_customer_name(body, display, expected):
 
 
 def test_greeting_never_uses_email_local_part():
-    request = {"customer_name": "Tonymemes969", "sender_email": "tonymemes969@gmail.com"}
+    request = {"customer_name": "Jsmith1987", "sender_email": "jsmith1987@example.com"}
     assert agent.greeting_name(request, "") == "there"
 
 

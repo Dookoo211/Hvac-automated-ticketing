@@ -1121,7 +1121,7 @@ def extract_customer_name(body: str, sender_name: str, sender_email: str) -> str
 def greeting_name(request: dict | None, sender_display_name: str) -> str:
     """Name used after "Hi" in customer emails: only something that clearly is a name.
 
-    The email local-part fallback is deliberately excluded ("Hi Tonymemes969"
+    The email local-part fallback is deliberately excluded ("Hi Jsmith1987"
     reads as a bot); "there" is the safe default.
     """
     candidates = [sender_display_name]
