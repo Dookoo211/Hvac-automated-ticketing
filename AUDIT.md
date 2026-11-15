@@ -1,6 +1,7 @@
 # AUDIT: HVAC Email Auto-Responder
 
 Audit date: 2026-11-15. No code was changed during this audit.
+Phase 1 status: see "Phase 1 results" at the end of this file.
 
 Scope: `README.md`, `CONFIG_REFERENCE.md`, `hvac_email_agent.py` (4,034 lines), `app/*.py`,
 `scripts/migrate_csv_to_db.py`, `hvac_agent.py`, `hvac_agent_ui.py`, `hvac_installer.py`,
@@ -301,3 +302,62 @@ Rewrite to match the code, and fold `CONFIG_REFERENCE.md` into it or regenerate 
    - (b) Make the UI minimize to tray and auto-start.
 8. **New dependency.** `keyring` (pure Python, uses Windows Credential Manager). OK to add a `requirements.txt` with `keyring` and `tzdata`, plus `pytest` for dev?
 9. **Tests in Phase 1?** Phase 1 changes safety-critical paths. I'd like to add a minimal fake-mailbox test harness *during* Phase 1 so each fix is verified, then expand it in Phase 3. OK?
+
+---
+
+## Phase 1 results (2026-11-15)
+
+Decisions applied: the defaults approved on 2026-11-15. Tests: `82 passed` (`.venv\Scripts\python -m pytest`), all against fake IMAP/SMTP servers.
+
+### Found during Phase 1 (not in the original audit)
+
+| ID | Severity | Finding | Status |
+|----|----------|---------|--------|
+| N1 | Critical | The **public** GitHub repo `Dookoo211/Hvac-automated-ticketing` tracked `config.json`, which contains the live Gmail app password (since 2026-05-18). It also tracked the SQLite DB, `logs/error.log`, `valid_licenses.json`, and `data/license_binding.json`, which holds a third party's email address. | Removed from the tip of `main` (commit 9d12af8). **Still in git history: the password must be revoked by the owner.** A history rewrite (force-push) is pending a decision. |
+| N2 | High | Sent-folder names were sent to IMAP unquoted (`SELECT [Gmail]/Sent Mail`), so manual-reply detection never worked and follow-ups would have been sent even after staff replied. | Fixed (`app/mailbox.quote_mailbox`). |
+| N3 | Low | UI functions `update_job` and `add_technician_ui` reference variables that are never defined (`job_id_var`, `tech_var`, …). They are not wired to any button today, so they are dead code that would crash if wired. | Open (Phase 2 cleanup). |
+| N4 | Medium | `detect_service`, `is_hvac_related`, and `infer_priority` used their own substring checks. For example, "heater" matched inside "theater", and "dead" inside "deadline" set High priority. | Fixed (whole-word matching everywhere). |
+
+### Status of original findings
+
+| ID | Status | Notes |
+|----|--------|-------|
+| C1 | Fixed | One SQLite transaction per email; intent-to-send committed before sending; interrupted sends are never resent (`outbound_messages.status='unknown'`). |
+| C2 | Fixed | Dry-run uses an in-memory DB copy, read-only mailbox selection, and no SMTP. |
+| C3 | Fixed | OS-level lock `data/agent.lock` shared by the daemon, one-shot CLI, and UI worker. |
+| C4 | Fixed | Own addresses (with +tag and Gmail-dot aliases), extra `own_addresses`, and any `X-HVAC-Auto` mail are ignored entirely. |
+| C5 | Fixed in code | Password lives in Windows Credential Manager; config writes strip it; EXEs no longer bundle `config.json`. Your local `config.json` still has the plaintext password until you run `scripts/migrate_config.py` (see HANDOFF). History: see N1. |
+| H1 | Fixed | Covers List-\*, Precedence (including auto_reply), Auto-Submitted, X-Autoreply/Autorespond, X-Auto-Response-Suppress, Return-Path `<>`, delivery reports, and no-reply local parts. Outgoing mail sets Auto-Submitted and X-Auto-Response-Suppress. |
+| H2 | Fixed | Single follow-up path with safety checks; cancelled on a manual reply, job progress, being >48 h overdue, or the feature being disabled; held if the Sent folder is unreadable. |
+| H3, H4 | Fixed | Whole-word matching; trimmed marketing list; new HVAC vocabulary; new `review` class. The classifier is still keyword-based and will have misses: see "Known classifier limits" below. |
+| H5 | Fixed (state) | All agent state is in SQLite; config and CSV writes are atomic. The license binding file still uses a plain write (licensing deferred by decision). |
+| H6 | Fixed | Per-message try/except; a failure is recorded, retried up to 3 times, and the message is left unread for staff. |
+| H7 | Fixed | The UI reset refuses while the agent is running and backs up first; `reset_install.bat` backs up first. Both abort if the backup fails. |
+| H8 | Fixed | Customer merge never overwrites a known value with a blank or "Unknown". |
+| H9 | Fixed | Requires an aligned DKIM/SPF or DMARC pass in the top-most Authentication-Results from `mx.google.com`. Acks no longer echo the body, address, or Maps link; the subject is echoed for threading only. |
+| H10 | Fixed | IMAP/SMTP timeouts (`network_timeout_seconds`), and exponential backoff capped at 15 min (30 min after a login rejection). |
+| M1 | Fixed | SQLite is the single source; CSVs are regenerated exports with the same columns. Legacy `job_tickets.csv` rows are not imported, because they were mirrored in the DB already. |
+| M2 | Fixed | Every mode keeps the ticket ID, status, technician, and schedule. `delete` is accepted as an alias for `ignore`. |
+| M3 | Fixed | Canonical flags plus legacy aliases (disagreement means off); full validation at startup. |
+| M4 | Fixed / changed | The configured `mailbox` is honoured. `ignore_promotions` is accepted but currently does nothing (it never worked). Proper Gmail category filtering needs live testing (Phase 2). |
+| M5, M6, M7, M8, M9, M10, M11 | Fixed | |
+| M12 | Fixed | Toggles patch only their own keys, and enabling live auto-replies asks for confirmation. |
+| M13 | Open | Setup still defaults to live mode (auto-reply itself defaults off). To revisit with M16 in Phase 2. |
+| M14 | Open (by decision) | Licensing is untouched. Options are listed in "Decisions needed". |
+| M15, M16 | Open | Phase 2: headless daemon EXE plus a startup task (decision 7), and a setup that does not clobber settings. |
+| L1 | Open | `scripts/migrate_csv_to_db.py` is still broken. Superseded by the automatic legacy import; delete or fix in Phase 2. |
+| L5, L6, L7, L9, L12, L13, L14 | Fixed | |
+| L2, L3, L4, L8, L10, L11 | Open | Phase 2. |
+
+### New config keys (all optional, with safe defaults)
+`own_addresses` [], `mark_processed_as_read` true, `require_sender_auth` true, `trusted_authserv_ids` ["mx.google.com"],
+`max_auto_emails_per_day` 50, `max_sms_per_day` 30, `max_reply_age_hours` 48 (0 = no limit), `network_timeout_seconds` 30.
+
+### Known classifier limits (still true after Phase 1)
+- The classifier is still keyword-based. Leads that use none of the vocabulary become `review` (ticket, no reply) if they are HVAC-related; otherwise they become `existing` (no ticket).
+- `existing` customers reporting a new problem get no ticket, as before.
+- Sender authentication assumes Gmail. For another provider, set `trusted_authserv_ids`; otherwise every auto-reply is held (a startup warning says so).
+
+### Not verified (needs a live mailbox or a build)
+- Real Gmail behaviour: IMAP `UID`, `BODY.PEEK`, INTERNALDATE parsing, the real `Authentication-Results` format, and whether Gmail drops self-sent mail into the inbox.
+- PyInstaller build with keyring/tzdata collection. The UI was only smoke-tested (built, one refresh, closed), never clicked through.
