@@ -78,7 +78,8 @@ Make the local-first HVAC email auto-responder (Python, Windows) reliable and sa
 
 ## Known issues / gotchas
 - Project path contains a comma and spaces: always quote it.
-- The PUBLIC repo's history (commits before 9d12af8) still contains the Gmail app password and a third party's email address.
+- The PUBLIC repo's history (commits before 9d12af8) still contains the Gmail app password and a third party's email address. Commit d945318 (this session, fixed in e8c38f9) also contains the mailbox's username as an example string. A history rewrite would cover all of these.
+- Before every push: `git grep -niE '<real addresses>' HEAD` must return nothing, and the push must be gated on that result (a missed check let d945318 through).
 - The user's local config.json still holds the plaintext password (works, prints a warning) until migrate_config runs.
 - `ignore_promotions` is accepted but has no effect (the old filter never worked).
 - Classifier is keyword-based; see AUDIT "Known classifier limits".
