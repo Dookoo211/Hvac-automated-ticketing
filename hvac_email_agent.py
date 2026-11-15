@@ -27,7 +27,9 @@ from typing import Iterable
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app import crm, database, notifications, scheduler, setup_wizard, technicians
+from app import crm, credentials, database, notifications, scheduler, settings, technicians
+from app.fileutil import atomic_write_json, atomic_write_text, backup_paths
+from app.settings import ConfigError
 
 
 WEEKDAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -140,7 +142,8 @@ DEFAULT_CONFIG = {
     "smtp_server": "smtp.example.com",
     "smtp_port": 587,
     "email_address": "you@example.com",
-    "email_password": "replace-with-app-password",
+    # NOTE: no "email_password" default on purpose. The password lives in
+    # Windows Credential Manager (app/credentials.py); see AUDIT C5.
     "mailbox": "INBOX",
     "sent_mailbox": "Sent",
     "read_unseen_only": True,
@@ -191,7 +194,29 @@ DEFAULT_CONFIG = {
     "error_log_file": "logs/error.log",
     "agent_log_file": "logs/hvac_agent.log",
     "dry_run": False,
+    # --- Safety settings added in Phase 1 (see AUDIT.md) ---
+    # Extra addresses that belong to this business (aliases). Mail from these
+    # is never processed or replied to (AUDIT C4).
+    "own_addresses": [],
+    # Keep the original behaviour of marking handled mail as read, but only
+    # AFTER it has been fully processed (AUDIT C1).
+    "mark_processed_as_read": True,
+    # Only auto-reply when the mail server vouches for the sender
+    # (aligned DKIM/SPF or DMARC pass), so forged From: addresses cannot use
+    # this mailbox as a relay (AUDIT H9).
+    "require_sender_auth": True,
+    "trusted_authserv_ids": ["mx.google.com"],
+    # Hard caps so a flood of inbound mail cannot get the account suspended (AUDIT M10).
+    "max_auto_emails_per_day": 50,
+    "max_sms_per_day": 30,
+    # Never acknowledge mail older than this (protects the first run against
+    # a backlog of old unread mail, and long outages).
+    "max_reply_age_hours": 48,
+    "network_timeout_seconds": 30,
 }
+
+# Keys that exist only at runtime and must never be written to config.json.
+RUNTIME_ONLY_KEYS = {"config_path", "email_password"}
 
 ADDRESS_PATTERN = re.compile(
     r"\b\d{1,6}\s+[A-Za-z0-9 .'-]+?(?:\s(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Way|Terrace|Ter|Place|Pl|Crescent|Cres|Ridge|Trail|Trl|Circle|Cir))(?:\s+(?:Apt|Unit|#)\s*[A-Za-z0-9-]+)?\b\.?",
@@ -397,41 +422,40 @@ def normalize_office_schedule(schedule: object) -> dict:
 
 
 def load_config(config_path: Path) -> dict:
-    """Load, merge, and validate runtime config from disk."""
+    """Load config.json, merge defaults, collapse legacy flags and validate.
+
+    Raises ConfigError listing *every* problem at once (AUDIT M3), so a client
+    fixing their config does not have to discover issues one restart at a time.
+    """
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
-    with config_path.open("r", encoding="utf-8") as f:
-        raw_config = json.load(f)
+    # utf-8-sig: tolerate the byte-order mark Windows Notepad adds when saving.
+    try:
+        raw_config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as err:
+        raise ConfigError([f"config.json is not valid JSON (line {err.lineno}, column {err.colno}): {err.msg}"]) from err
+    if not isinstance(raw_config, dict):
+        raise ConfigError(["config.json must contain a JSON object ({ ... })."])
 
     config = deep_merge(DEFAULT_CONFIG, raw_config)
+    warnings = settings.resolve_flag_pairs(raw_config, config)
     config["office_schedule"] = normalize_office_schedule(config.get("office_schedule"))
 
-    required = [
-        "business_name",
-        "services",
-        "office_hours",
-        "phone_number",
-        "lead_keywords",
-        "existing_keywords",
-        "spam_keywords",
-        "imap_server",
-        "imap_port",
-        "smtp_server",
-        "smtp_port",
-        "email_address",
-        "email_password",
-    ]
-    missing = [key for key in required if key not in config]
-    if missing:
-        raise ValueError(f"Missing required config fields: {', '.join(missing)}")
+    problems = settings.validate_config(config)
+    if problems:
+        raise ConfigError(problems)
 
+    config["ticket_duplicate_mode"] = settings.normalize_duplicate_mode(config.get("ticket_duplicate_mode"))
+    for warning in warnings + settings.config_warnings(config):
+        print(f"CONFIG WARNING: {warning}")
     return config
 
 
 def has_email_credentials(config: dict) -> bool:
-    """Return True if both email address and app password are present."""
-    return bool(str(config.get("email_address", "")).strip()) and bool(str(config.get("email_password", "")).strip())
+    """Return True if an address is set and a password is available
+    (Credential Manager, or a legacy plaintext value in config.json)."""
+    return bool(str(config.get("email_address", "")).strip()) and credentials.has_credentials(config)
 
 
 def load_processed_ids(path: Path) -> set[str]:
@@ -637,8 +661,17 @@ def write_license_binding(config: dict) -> None:
     )
 
 
+def config_for_disk(config: dict) -> dict:
+    """Return a copy of config that is safe to write to config.json.
+
+    WHY: setup and the UI used to dump the whole in-memory config, which put
+    the mailbox password (and runtime-only keys) into config.json (AUDIT C5).
+    """
+    return {key: value for key, value in config.items() if key not in RUNTIME_ONLY_KEYS and not key.startswith("_")}
+
+
 def write_config_files(config: dict, config_path: Path) -> list[Path]:
-    """Write config.json and keep root/release configs in sync when present."""
+    """Write config.json (atomically, without secrets) and keep root/release configs in sync."""
     targets: list[Path] = [config_path.resolve()]
     project_root = Path(__file__).resolve().parent
     root_config = project_root / "config.json"
@@ -651,12 +684,28 @@ def write_config_files(config: dict, config_path: Path) -> list[Path]:
         if root_config.exists():
             targets.append(root_config.resolve())
 
+    safe = config_for_disk(config)
     for path in targets:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+        atomic_write_json(path, safe)
         ensure_runtime_paths(config, path.parent)
     return targets
+
+
+def patch_config_file(config_path: Path, updates: dict) -> None:
+    """Change only the given keys in config.json, leaving everything else as the user wrote it.
+
+    WHY: the UI used to rewrite config.json from the merged in-memory dict on
+    every checkbox click (AUDIT M12), which added every default and the password.
+    """
+    raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    raw.update(updates)
+    # Drop runtime-only keys an older version may have written. We do NOT
+    # drop a legacy plaintext email_password here: on an old install it may be
+    # the only copy, and a checkbox click must never lose the login.
+    # scripts/migrate_config.py moves it to Credential Manager safely.
+    for key in RUNTIME_ONLY_KEYS - {"email_password"}:
+        raw.pop(key, None)
+    atomic_write_json(config_path, raw)
 
 
 def ensure_runtime_paths(config: dict, base_dir: Path) -> None:
